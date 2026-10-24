@@ -8,7 +8,33 @@ It talks to shairport-sync over D-Bus and controls the receiver through
 `systemd --user`, so it is meant for a per-user install with
 `shairport-sync.service` and `nqptp.service` as user units.
 
-## Requirements
+## Install the .deb (Debian 13, amd64)
+
+The `shairport-sync-desktop` package from this fork's
+[releases](https://github.com/Ari-Santa/shairport-sync/releases) installs the
+whole receiver: Shairport Sync built for AirPlay 2, NQPTP, this app, and the
+systemd user services.
+
+```
+sudo apt install ./shairport-sync-desktop_5.6.1-1_amd64.deb
+```
+
+The receiver starts right away in your session and at every login. Your
+settings are in `~/.config/shairport-sync/shairport-sync.conf` (copied from
+`/etc/shairport-sync.conf` on first start); open them from the app's menu with
+"Edit Settings…". The package replaces Debian's own `shairport-sync`.
+
+To build the package yourself, from a clone with submodules
+(`git clone --recurse-submodules …`):
+
+```
+sudo apt build-dep ./
+dpkg-buildpackage -b -us -uc
+```
+
+## Install from source
+
+### Requirements
 
 * shairport-sync configured with `--with-dbus-interface --with-mpris-interface`.
 * Both interfaces on the session bus, plus cover art, in `shairport-sync.conf`:
@@ -27,7 +53,7 @@ It talks to shairport-sync over D-Bus and controls the receiver through
   sudo apt install python3-pyqt6 python3-pyqt6.qtquick qml6-module-org-kde-kirigami
   ```
 
-## Install
+### Install
 
 ```
 sh gui/install.sh

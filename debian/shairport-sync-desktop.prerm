@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# Stop the receiver in running sessions so nobody is left with a deleted
+# binary still holding the AirPlay ports.
+if [ "$1" = "remove" ] && command -v loginctl >/dev/null 2>&1; then
+    loginctl list-users --no-legend 2>/dev/null | while read -r uid user _; do
+        [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        systemctl --user --machine="$user@" stop shairport-sync.service nqptp.service >/dev/null 2>&1 || true
+    done
+fi
+
+#DEBHELPER#
+
+exit 0

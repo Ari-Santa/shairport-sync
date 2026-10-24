@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # NQPTP runs in each user's session but must bind the privileged PTP
+    # ports 319 and 320. The capability is lost whenever dpkg replaces the
+    # binary, so it is (re)applied on every configure.
+    if ! setcap cap_net_bind_service=+ep /usr/bin/nqptp; then
+        echo "shairport-sync-desktop: could not give /usr/bin/nqptp the" \
+             "cap_net_bind_service capability; AirPlay 2 will not work." >&2
+    fi
+fi
+
+#DEBHELPER#
+
+# dh_installsystemduser only enables the receiver for future logins. Start it
+# (or restart it, on upgrade) in the sessions of users logged in right now, so
+# it works without logging out. Accounts below UID 1000, such as the login
+# screen's, are skipped.
+if [ "$1" = "configure" ] && [ -z "$DPKG_ROOT" ] && command -v loginctl >/dev/null 2>&1; then
+    loginctl list-users --no-legend 2>/dev/null | while read -r uid user _; do
+        [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        if [ -z "$2" ]; then
+            systemctl --user --machine="$user@" start shairport-sync.service >/dev/null 2>&1 || true
+        else
+            systemctl --user --machine="$user@" try-restart nqptp.service shairport-sync.service >/dev/null 2>&1 || true
+        fi
+    done
+fi
+
+exit 0

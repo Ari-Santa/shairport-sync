@@ -1,0 +1,7 @@
+shairport-sync-desktop (5.6.1-1) trixie; urgency=medium
+
+  * Initial release: Shairport Sync 5.6.1 built for AirPlay 2 with NQPTP 1.2.9,
+    both running as systemd user services in the desktop session, plus the
+    AirPlay Receiver now-playing app.
+
+ -- Ari-Santa <apeach@live.no>  Sat, 24 Oct 2026 19:55:12 +0200

@@ -1,0 +1,9 @@
+/.debhelper/
+/debhelper-build-stamp
+/files
+/*.substvars
+/*.debhelper
+/*.debhelper.log
+/shairport-sync-desktop/
+/shairport-sync-desktop-dbgsym/
+/tmp/

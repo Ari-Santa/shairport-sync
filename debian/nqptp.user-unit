@@ -1,0 +1,12 @@
+[Unit]
+Description=NQPTP -- Not Quite PTP (AirPlay 2 timing for Shairport Sync)
+Documentation=man:nqptp(8)
+After=network-online.target
+Before=shairport-sync.service
+
+[Service]
+# /usr/bin/nqptp has cap_net_bind_service (set in postinst) for ports 319/320.
+# Started on demand by shairport-sync.service, which Wants= it.
+ExecStart=/usr/bin/nqptp
+Restart=on-failure
+RestartSec=2

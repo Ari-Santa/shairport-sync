@@ -1,0 +1,3 @@
+[submodule "nqptp"]
+	path = nqptp
+	url = https://github.com/mikebrady/nqptp.git

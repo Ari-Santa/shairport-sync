@@ -1,0 +1,16 @@
+[Unit]
+Description=Shairport Sync - AirPlay 2 Audio Receiver
+Documentation=man:shairport-sync(1)
+After=sound.target nqptp.service pipewire.service wireplumber.service
+Wants=nqptp.service
+
+[Service]
+# Each user gets an editable copy of the system-wide defaults.
+ExecStartPre=/usr/bin/mkdir -p %E/shairport-sync
+ExecStartPre=-/usr/bin/cp -n /etc/shairport-sync.conf %E/shairport-sync/shairport-sync.conf
+ExecStart=/usr/bin/shairport-sync -c %E/shairport-sync/shairport-sync.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

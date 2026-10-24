@@ -1,0 +1,65 @@
+Source: shairport-sync-desktop
+Section: sound
+Priority: optional
+Maintainer: Ari-Santa <apeach@live.no>
+Build-Depends: debhelper-compat (= 13),
+               autoconf,
+               automake,
+               libasound2-dev,
+               libavahi-client-dev,
+               libavcodec-dev,
+               libavformat-dev,
+               libavutil-dev,
+               libconfig-dev,
+               libgcrypt20-dev,
+               libglib2.0-dev,
+               libpipewire-0.3-dev,
+               libplist-dev,
+               libplist-utils,
+               libpopt-dev,
+               libpulse-dev,
+               libsodium-dev,
+               libsoxr-dev,
+               libssl-dev,
+               libswresample-dev,
+               libtool,
+               pkgconf,
+               uuid-dev,
+               xxd,
+Standards-Version: 4.7.0
+Homepage: https://github.com/Ari-Santa/shairport-sync
+Vcs-Browser: https://github.com/Ari-Santa/shairport-sync
+Vcs-Git: https://github.com/Ari-Santa/shairport-sync.git
+Rules-Requires-Root: no
+
+Package: shairport-sync-desktop
+Architecture: any
+Depends: avahi-daemon,
+         libcap2-bin,
+         python3,
+         python3-pyqt6,
+         python3-pyqt6.qtquick,
+         qml6-module-org-kde-desktop,
+         qml6-module-org-kde-kirigami,
+         qml6-module-qtquick,
+         qml6-module-qtquick-controls,
+         qml6-module-qtquick-effects,
+         qml6-module-qtquick-layouts,
+         qt6-svg-plugins,
+         ${misc:Depends},
+         ${shlibs:Depends},
+Recommends: pipewire,
+            wireplumber,
+Conflicts: nqptp,
+           shairport-sync,
+Replaces: nqptp,
+          shairport-sync,
+Description: AirPlay 2 audio receiver for desktop users
+ Shairport Sync built as an AirPlay 2 receiver that runs as a systemd user
+ service in the desktop session and plays through PipeWire, together with
+ NQPTP, the timing companion AirPlay 2 needs, and AirPlay Receiver, a
+ Kirigami app that shows what is playing and controls the receiver.
+ .
+ The receiver starts automatically when a user logs in. Each user's
+ settings live in ~/.config/shairport-sync/shairport-sync.conf, which is
+ created from /etc/shairport-sync.conf the first time the receiver runs.
