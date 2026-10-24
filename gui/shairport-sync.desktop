@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AirPlay Receiver
+GenericName=AirPlay Speaker
+Comment=See and control what's playing on this computer's AirPlay receiver
+Exec=shairport-sync-gui
+Icon=shairport-sync
+Terminal=false
+Categories=AudioVideo;Audio;Player;Qt;KDE;
+Keywords=airplay;shairport;speaker;now playing;music;
+StartupNotify=true

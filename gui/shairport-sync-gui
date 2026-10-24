@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""AirPlay Receiver -- a now-playing window for Shairport Sync.
+
+Reads the MPRIS and native D-Bus interfaces that shairport-sync publishes on
+the session bus (set dbus_service_bus and mpris_service_bus to "session") and
+drives a Kirigami UI. It also starts and stops the receiver's systemd --user
+units (shairport-sync.service and nqptp.service).
+"""
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt6.QtDBus import QDBus, QDBusConnection, QDBusMessage, QDBusServiceWatcher
+from PyQt6.QtGui import QDesktopServices, QIcon
+from PyQt6.QtQml import QQmlApplicationEngine
+from PyQt6.QtWidgets import QApplication
+
+HERE = Path(__file__).resolve().parent
+
+MPRIS_SERVICE = "org.mpris.MediaPlayer2.ShairportSync"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+SPS_SERVICE = "org.gnome.ShairportSync"
+SPS_PATH = "/org/gnome/ShairportSync"
+SPS_IFACE = "org.gnome.ShairportSync"
+SPS_REMOTE = "org.gnome.ShairportSync.RemoteControl"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+SYSTEMD_SERVICE = "org.freedesktop.systemd1"
+SYSTEMD_PATH = "/org/freedesktop/systemd1"
+SYSTEMD_MANAGER = "org.freedesktop.systemd1.Manager"
+SYSTEMD_UNIT = "org.freedesktop.systemd1.Unit"
+RECEIVER_UNIT = "shairport-sync.service"
+TIMING_UNIT = "nqptp.service"
+
+CONFIG_FILE = Path.home() / ".config/shairport-sync/shairport-sync.conf"
+SYSTEM_CONFIG_FILE = Path("/etc/shairport-sync.conf")
+
+DBUS_TIMEOUT_MS = 1000
+
+
+def _first(value):
+    """MPRIS lists (e.g. xesam:artist) are shown joined; scalars as-is."""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value if v)
+    return "" if value is None else str(value)
+
+
+class Receiver(QObject):
+    """Mirror of shairport-sync's D-Bus state, exposed to QML."""
+
+    stateChanged = pyqtSignal()
+    positionChanged = pyqtSignal()
+    errorOccurred = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._bus = QDBusConnection.sessionBus()
+        self._state = self._empty_state()
+        self._unit_state = "unknown"
+        self._position = 0.0
+
+        # Coalesce bursts of PropertiesChanged signals into one refresh.
+        self._refresh_timer = QTimer(self, singleShot=True, interval=50)
+        self._refresh_timer.timeout.connect(self.refresh)
+
+        self._position_timer = QTimer(self, interval=500)
+        self._position_timer.timeout.connect(self._poll_position)
+
+        self._unit_timer = QTimer(self, interval=2000)
+        self._unit_timer.timeout.connect(self._poll_unit)
+        self._unit_timer.start()
+
+        for service, path in ((MPRIS_SERVICE, MPRIS_PATH), (SPS_SERVICE, SPS_PATH)):
+            self._bus.connect(service, path, PROPS_IFACE, "PropertiesChanged",
+                              self._on_properties_changed)
+
+        self._watcher = QDBusServiceWatcher(
+            MPRIS_SERVICE, self._bus,
+            QDBusServiceWatcher.WatchModeFlag.WatchForRegistration
+            | QDBusServiceWatcher.WatchModeFlag.WatchForUnregistration,
+            self)
+        self._watcher.serviceRegistered.connect(lambda _name: self._refresh_timer.start())
+        self._watcher.serviceUnregistered.connect(lambda _name: self.refresh())
+
+        self._poll_unit()
+        self.refresh()
+
+    @staticmethod
+    def _empty_state():
+        return {
+            "online": False,
+            "receiverName": "",
+            "version": "",
+            "active": False,
+            "clientName": "",
+            "clientAddress": "",
+            "playbackStatus": "Stopped",
+            "title": "",
+            "artist": "",
+            "album": "",
+            "artUrl": "",
+            "duration": 0.0,
+            "volume": 0.0,
+            "sourceFormat": "",
+            "outputFormat": "",
+        }
+
+    # ---- QML properties ------------------------------------------------
+
+    # Class-body helper; the signal is bound as a default because a function
+    # body can't see names from the enclosing class scope.
+    def _state_property(key, type_=str, notify=stateChanged):  # noqa: N805
+        return pyqtProperty(type_, lambda self: self._state[key], notify=notify)
+
+    online = _state_property("online", bool)
+    receiverName = _state_property("receiverName")
+    version = _state_property("version")
+    active = _state_property("active", bool)
+    clientName = _state_property("clientName")
+    clientAddress = _state_property("clientAddress")
+    playbackStatus = _state_property("playbackStatus")
+    title = _state_property("title")
+    artist = _state_property("artist")
+    album = _state_property("album")
+    artUrl = _state_property("artUrl")
+    duration = _state_property("duration", float)
+    volume = _state_property("volume", float)
+    sourceFormat = _state_property("sourceFormat")
+    outputFormat = _state_property("outputFormat")
+
+    del _state_property
+
+    @pyqtProperty(str, notify=stateChanged)
+    def unitState(self):
+        return self._unit_state
+
+    @pyqtProperty(float, notify=positionChanged)
+    def position(self):
+        return self._position
+
+    @pyqtProperty(str, constant=True)
+    def configFile(self):
+        return str(CONFIG_FILE)
+
+    # ---- D-Bus helpers -------------------------------------------------
+
+    def _call(self, service, path, interface, method, *args):
+        msg = QDBusMessage.createMethodCall(service, path, interface, method)
+        if args:
+            msg.setArguments(list(args))
+        reply = self._bus.call(msg, QDBus.CallMode.Block, DBUS_TIMEOUT_MS)
+        if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+            raise RuntimeError(reply.errorMessage() or reply.errorName())
+        return reply.arguments()
+
+    def _get_all(self, service, path, interface):
+        try:
+            return self._call(service, path, PROPS_IFACE, "GetAll", interface)[0]
+        except (RuntimeError, IndexError):
+            return None
+
+    # ---- state refresh -------------------------------------------------
+
+    @pyqtSlot(QDBusMessage)
+    def _on_properties_changed(self, _msg):
+        self._refresh_timer.start()
+
+    @pyqtSlot()
+    def refresh(self):
+        player = self._get_all(MPRIS_SERVICE, MPRIS_PATH, MPRIS_PLAYER)
+        if player is None:
+            self._set_state(self._empty_state())
+            return
+        core = self._get_all(SPS_SERVICE, SPS_PATH, SPS_IFACE) or {}
+        remote = self._get_all(SPS_SERVICE, SPS_PATH, SPS_REMOTE) or {}
+        meta = player.get("Metadata") or {}
+
+        self._set_state({
+            "online": True,
+            "receiverName": core.get("ServiceName", ""),
+            "version": core.get("Version", ""),
+            "active": bool(core.get("Active", False)),
+            "clientName": remote.get("ClientName", ""),
+            "clientAddress": remote.get("Client", ""),
+            "playbackStatus": player.get("PlaybackStatus", "Stopped"),
+            "title": _first(meta.get("xesam:title")),
+            "artist": _first(meta.get("xesam:artist")),
+            "album": _first(meta.get("xesam:album")),
+            "artUrl": _first(meta.get("mpris:artUrl")),
+            "duration": float(meta.get("mpris:length") or 0) / 1e6,
+            "volume": float(player.get("Volume", 0.0)),
+            "sourceFormat": core.get("SourceFormat", ""),
+            "outputFormat": core.get("OutputFormat", ""),
+        })
+        self._poll_position()
+
+    def _set_state(self, new_state):
+        if new_state != self._state:
+            self._state = new_state
+            self.stateChanged.emit()
+        if self._state["playbackStatus"] == "Playing":
+            self._position_timer.start()
+        else:
+            self._position_timer.stop()
+        if not self._state["online"] and self._position:
+            self._position = 0.0
+            self.positionChanged.emit()
+
+    def _poll_position(self):
+        if not self._state["online"]:
+            return
+        try:
+            value = self._call(MPRIS_SERVICE, MPRIS_PATH, PROPS_IFACE, "Get",
+                               MPRIS_PLAYER, "Position")[0]
+        except (RuntimeError, IndexError):
+            return
+        seconds = float(value or 0) / 1e6
+        if abs(seconds - self._position) > 0.05:
+            self._position = seconds
+            self.positionChanged.emit()
+
+    def _poll_unit(self):
+        try:
+            unit_path = self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER,
+                                   "LoadUnit", RECEIVER_UNIT)[0]
+            unit_path = unit_path.path() if hasattr(unit_path, "path") else str(unit_path)
+            state = self._call(SYSTEMD_SERVICE, unit_path, PROPS_IFACE, "Get",
+                               SYSTEMD_UNIT, "ActiveState")[0]
+        except (RuntimeError, IndexError):
+            state = "unknown"
+        if state != self._unit_state:
+            self._unit_state = state
+            self.stateChanged.emit()
+
+    # ---- actions -------------------------------------------------------
+
+    def _player_command(self, method, *args):
+        try:
+            self._call(MPRIS_SERVICE, MPRIS_PATH, MPRIS_PLAYER, method, *args)
+        except RuntimeError as err:
+            self.errorOccurred.emit(f"{method} failed: {err}")
+
+    @pyqtSlot()
+    def playPause(self):
+        self._player_command("PlayPause")
+
+    @pyqtSlot()
+    def next(self):
+        self._player_command("Next")
+
+    @pyqtSlot()
+    def previous(self):
+        self._player_command("Previous")
+
+    @pyqtSlot(float)
+    def setVolume(self, value):
+        self._player_command("SetVolume", max(0.0, min(1.0, float(value))))
+
+    @pyqtSlot()
+    def disconnectSender(self):
+        try:
+            self._call(SPS_SERVICE, SPS_PATH, SPS_IFACE, "DropSession")
+        except RuntimeError as err:
+            self.errorOccurred.emit(f"Could not disconnect: {err}")
+
+    def _manage_units(self, method, units):
+        try:
+            for unit in units:
+                self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER, method, unit, "replace")
+        except RuntimeError as err:
+            self.errorOccurred.emit(f"Could not {method[:-4].lower()} the receiver: {err}")
+        QTimer.singleShot(300, self._poll_unit)
+
+    @pyqtSlot()
+    def startReceiver(self):
+        # shairport-sync.service Wants= nqptp.service, so this brings up both.
+        self._manage_units("StartUnit", (RECEIVER_UNIT,))
+
+    @pyqtSlot()
+    def stopReceiver(self):
+        self._manage_units("StopUnit", (RECEIVER_UNIT, TIMING_UNIT))
+
+    @pyqtSlot()
+    def restartReceiver(self):
+        self._manage_units("RestartUnit", (TIMING_UNIT, RECEIVER_UNIT))
+
+    @pyqtSlot()
+    def openConfig(self):
+        # The packaged user service seeds the per-user file from /etc on first
+        # start; do the same here so settings can be edited before that.
+        if not CONFIG_FILE.exists() and SYSTEM_CONFIG_FILE.exists():
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(SYSTEM_CONFIG_FILE, CONFIG_FILE)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(CONFIG_FILE)))
+
+
+def main():
+    # Use Plasma's own Qt Quick Controls style so the window matches the desktop.
+    os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("shairport-sync-gui")
+    app.setOrganizationName("shairport-sync")
+    # Matches shairport-sync's MPRIS DesktopEntry, so Plasma ties the two together.
+    app.setDesktopFileName("shairport-sync")
+    app.setWindowIcon(QIcon.fromTheme("shairport-sync", QIcon(str(HERE / "shairport-sync.svg"))))
+
+    receiver = Receiver()
+    engine = QQmlApplicationEngine()
+    engine.setInitialProperties({"receiver": receiver})
+    engine.load(QUrl.fromLocalFile(str(HERE / "qml" / "Main.qml")))
+    if not engine.rootObjects():
+        return 1
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
