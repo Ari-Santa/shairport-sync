@@ -16,6 +16,21 @@ Kirigami.ApplicationWindow {
     readonly property bool hasTrack: streaming && receiver.title !== ""
     readonly property string speakerName: receiver.receiverName || "this computer"
 
+    // Output choices: "" follows the system default; anything else is a sink's node.name.
+    readonly property var outputEntries: {
+        const entries = [{
+            name: "",
+            label: receiver.defaultOutput ? "Follow System (" + receiver.defaultOutput + ")" : "Follow System"
+        }];
+        for (const output of receiver.outputs)
+            entries.push({ name: output.name, label: output.description });
+        const target = receiver.outputTarget;
+        if (target !== "" && !receiver.outputs.some(output => output.name === target))
+            entries.push({ name: target, label: (receiver.outputTargetLabel || target) + " (not connected)" });
+        return entries;
+    }
+    readonly property int outputIndex: Math.max(0, outputEntries.findIndex(e => e.name === receiver.outputTarget))
+
     function formatTime(seconds) {
         const total = Math.max(0, Math.floor(seconds));
         const h = Math.floor(total / 3600);
@@ -378,13 +393,63 @@ Kirigami.ApplicationWindow {
             }
         }
 
-        footer: QQC2.Label {
-            padding: Kirigami.Units.smallSpacing
-            visible: root.receiver.version !== "" && !root.streaming
-            text: "Shairport Sync " + root.receiver.version + " · AirPlay 2"
-            horizontalAlignment: Text.AlignHCenter
-            font: Kirigami.Theme.smallFont
-            opacity: 0.5
+        footer: ColumnLayout {
+            spacing: 0
+
+            QQC2.Label {
+                Layout.fillWidth: true
+                padding: Kirigami.Units.smallSpacing
+                visible: root.receiver.version !== "" && !root.streaming
+                text: "Shairport Sync " + root.receiver.version + " · AirPlay 2"
+                horizontalAlignment: Text.AlignHCenter
+                font: Kirigami.Theme.smallFont
+                opacity: 0.5
+            }
+
+            QQC2.ToolBar {
+                Layout.fillWidth: true
+                visible: root.receiver.outputSwitchingAvailable
+                position: QQC2.ToolBar.Footer
+
+                RowLayout {
+                    anchors.fill: parent
+                    spacing: Kirigami.Units.smallSpacing
+
+                    Kirigami.Icon {
+                        source: "audio-speakers-symbolic"
+                        implicitWidth: Kirigami.Units.iconSizes.smallMedium
+                        implicitHeight: implicitWidth
+                    }
+                    QQC2.Label {
+                        text: "Output"
+                    }
+                    QQC2.ComboBox {
+                        id: outputBox
+                        objectName: "outputPicker"
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: Kirigami.Units.gridUnit * 6
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 10
+                        model: root.outputEntries
+                        textRole: "label"
+                        valueRole: "name"
+                        currentIndex: root.outputIndex
+                        // The list says which device the system default is; the field stays short.
+                        displayText: currentIndex === 0 ? "Follow System" : currentText
+                        onActivated: root.receiver.setOutput(currentValue)
+
+                        QQC2.ToolTip.text: currentText
+                        QQC2.ToolTip.visible: hovered && !popup.visible
+                        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+
+                        Connections {
+                            target: outputBox.popup
+                            function onAboutToShow() {
+                                root.receiver.refreshOutputs();
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

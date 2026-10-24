@@ -7,12 +7,14 @@ drives a Kirigami UI. It also starts and stops the receiver's systemd --user
 units (shairport-sync.service and nqptp.service).
 """
 
+import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QProcess, QTimer, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
 from PyQt6.QtDBus import QDBus, QDBusConnection, QDBusMessage, QDBusServiceWatcher
 from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtQml import QQmlApplicationEngine
@@ -40,6 +42,15 @@ CONFIG_FILE = Path.home() / ".config/shairport-sync/shairport-sync.conf"
 SYSTEM_CONFIG_FILE = Path("/etc/shairport-sync.conf")
 
 DBUS_TIMEOUT_MS = 1000
+OUTPUT_POLL_MS = 3000
+
+# The pipewire.sink_target line as shipped (commented out = follow the system default).
+SINK_TARGET_DEFAULT_LINE = ('//\tsink_target = "<sink target name>"; // Leave this commented out '
+                            'to get the sink target already chosen by the PipeWire system.\n')
+SINK_TARGET_LINE_RE = re.compile(r'^\s*(//)?\s*sink_target\s*=')
+SINK_TARGET_VALUE_RE = re.compile(r'^\s*sink_target\s*=\s*"((?:[^"\\]|\\.)*)"\s*;(.*)$')
+LABEL_MARKER = "AirPlay Receiver: "
+OUTPUT_BACKEND_RE = re.compile(r'^\s*output_backend\s*=\s*"([^"]*)"')
 
 
 def _first(value):
@@ -49,11 +60,94 @@ def _first(value):
     return "" if value is None else str(value)
 
 
+# ---- the user's shairport-sync.conf -------------------------------------
+
+def _ensure_user_config():
+    # The packaged user service seeds the per-user file from /etc on first
+    # start; do the same here so it can be edited before that.
+    if not CONFIG_FILE.exists() and SYSTEM_CONFIG_FILE.exists():
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(SYSTEM_CONFIG_FILE, CONFIG_FILE)
+
+
+def _config_lines():
+    for path in (CONFIG_FILE, SYSTEM_CONFIG_FILE):
+        try:
+            return path.read_text().splitlines(keepends=True)
+        except OSError:
+            continue
+    return []
+
+
+def _section_bounds(lines, name):
+    """Line range (start, end) of `name = { ... };`, or None if absent."""
+    start = next((i for i, line in enumerate(lines)
+                  if re.match(rf'^{name}\s*=', line.strip())), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("};")),
+               len(lines))
+    return start, end
+
+
+def _read_sink_target():
+    """(node.name, label) from pipewire.sink_target; ("", "") means follow the default."""
+    lines = _config_lines()
+    bounds = _section_bounds(lines, "pipewire")
+    if bounds:
+        for line in lines[bounds[0]:bounds[1]]:
+            match = SINK_TARGET_VALUE_RE.match(line)
+            if match:
+                comment = match.group(2)
+                label = comment.split(LABEL_MARKER, 1)[1].strip() if LABEL_MARKER in comment else ""
+                return match.group(1).replace('\\"', '"').replace("\\\\", "\\"), label
+    return "", ""
+
+
+def _write_sink_target(name, label):
+    _ensure_user_config()
+    lines = CONFIG_FILE.read_text().splitlines(keepends=True)
+    if name:
+        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+        label = " ".join(label.split())
+        new_line = f'\tsink_target = "{escaped}"; // {LABEL_MARKER}{label}\n'
+    else:
+        new_line = SINK_TARGET_DEFAULT_LINE
+
+    bounds = _section_bounds(lines, "pipewire")
+    if bounds is None:
+        lines += ["\npipewire =\n", "{\n", new_line, "};\n"]
+    else:
+        start, end = bounds
+        existing = next((i for i in range(start, end) if SINK_TARGET_LINE_RE.match(lines[i])), None)
+        if existing is not None:
+            lines[existing] = new_line
+        else:
+            brace = next((i for i in range(start, end) if "{" in lines[i]), start)
+            lines.insert(brace + 1, new_line)
+
+    tmp = CONFIG_FILE.with_suffix(".conf.tmp")
+    tmp.write_text("".join(lines))
+    os.replace(tmp, CONFIG_FILE)
+
+
+def _uses_pipewire_backend():
+    lines = _config_lines()
+    bounds = _section_bounds(lines, "general")
+    if bounds:
+        for line in lines[bounds[0]:bounds[1]]:
+            match = OUTPUT_BACKEND_RE.match(line)
+            if match:
+                return match.group(1) == "pipewire"
+    return False
+
+
 class Receiver(QObject):
     """Mirror of shairport-sync's D-Bus state, exposed to QML."""
 
     stateChanged = pyqtSignal()
     positionChanged = pyqtSignal()
+    outputsChanged = pyqtSignal()
     errorOccurred = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -62,6 +156,26 @@ class Receiver(QObject):
         self._state = self._empty_state()
         self._unit_state = "unknown"
         self._position = 0.0
+
+        # Output selection. The lasting choice is pipewire.sink_target in the
+        # user's config, which shairport-sync only reads at startup, so a change
+        # is applied by restarting it once nothing is playing. A stream that is
+        # already playing is moved straight away through PipeWire metadata.
+        self._pipewire_ok = False
+        self._sinks = []
+        self._default_sink = ""
+        self._stream_id = None
+        self._output_target, self._output_label = _read_sink_target()
+        self._running_target = self._output_target  # what the receiver process started with
+        self._restart_pending = False
+
+        self._pw_dump = QProcess(self)
+        self._pw_dump.finished.connect(self._on_pw_dump_finished)
+        self._pw_dump.errorOccurred.connect(self._on_pw_dump_error)
+        self._output_timer = QTimer(self, interval=OUTPUT_POLL_MS)
+        self._output_timer.timeout.connect(self.refreshOutputs)
+        self._output_timer.start()
+        self.refreshOutputs()
 
         # Coalesce bursts of PropertiesChanged signals into one refresh.
         self._refresh_timer = QTimer(self, singleShot=True, interval=50)
@@ -146,6 +260,26 @@ class Receiver(QObject):
     def configFile(self):
         return str(CONFIG_FILE)
 
+    @pyqtProperty(bool, notify=outputsChanged)
+    def outputSwitchingAvailable(self):
+        return self._pipewire_ok and _uses_pipewire_backend()
+
+    @pyqtProperty("QVariantList", notify=outputsChanged)
+    def outputs(self):
+        return self._sinks
+
+    @pyqtProperty(str, notify=outputsChanged)
+    def defaultOutput(self):
+        return next((s["description"] for s in self._sinks if s["name"] == self._default_sink), "")
+
+    @pyqtProperty(str, notify=outputsChanged)
+    def outputTarget(self):
+        return self._output_target
+
+    @pyqtProperty(str, notify=outputsChanged)
+    def outputTargetLabel(self):
+        return self._output_label
+
     # ---- D-Bus helpers -------------------------------------------------
 
     def _call(self, service, path, interface, method, *args):
@@ -209,6 +343,7 @@ class Receiver(QObject):
         if not self._state["online"] and self._position:
             self._position = 0.0
             self.positionChanged.emit()
+        self._apply_pending_restart()
 
     def _poll_position(self):
         if not self._state["online"]:
@@ -235,6 +370,108 @@ class Receiver(QObject):
         if state != self._unit_state:
             self._unit_state = state
             self.stateChanged.emit()
+
+    # ---- audio outputs -------------------------------------------------
+
+    @pyqtSlot()
+    def refreshOutputs(self):
+        if self._pw_dump.state() == QProcess.ProcessState.NotRunning:
+            self._pw_dump.start("pw-dump", [])
+
+    def _on_pw_dump_error(self, _error):
+        if self._pipewire_ok:
+            self._pipewire_ok = False
+            self.outputsChanged.emit()
+
+    def _on_pw_dump_finished(self, _code, _status):
+        try:
+            objects = json.loads(bytes(self._pw_dump.readAllStandardOutput()) or b"[]")
+        except ValueError:
+            return
+
+        sps_clients = set()
+        nodes = []
+        default_sink = ""
+        stream_targets = {}
+        for obj in objects:
+            kind = obj.get("type", "")
+            props = (obj.get("info") or {}).get("props") or {}
+            if kind == "PipeWire:Interface:Client":
+                if props.get("application.process.binary") == "shairport-sync":
+                    sps_clients.add(obj.get("id"))
+            elif kind == "PipeWire:Interface:Node":
+                nodes.append((obj.get("id"), props))
+            elif kind == "PipeWire:Interface:Metadata":
+                if (obj.get("props") or {}).get("metadata.name") != "default":
+                    continue
+                for entry in obj.get("metadata") or []:
+                    if entry.get("subject") == 0 and entry.get("key") == "default.audio.sink":
+                        value = entry.get("value")
+                        default_sink = value.get("name", "") if isinstance(value, dict) else ""
+                    elif entry.get("key") == "target.object":
+                        stream_targets[entry.get("subject")] = entry.get("value")
+
+        sinks = sorted(
+            ({"name": p.get("node.name", ""),
+              "description": p.get("node.description") or p.get("node.nick") or p.get("node.name", "")}
+             for _id, p in nodes if p.get("media.class") == "Audio/Sink"),
+            key=lambda s: s["description"].casefold())
+        stream_id = next((node_id for node_id, p in nodes
+                          if p.get("media.class") == "Stream/Output/Audio"
+                          and p.get("client.id") in sps_clients), None)
+
+        if stream_id is not None and stream_id != self._stream_id:
+            # A new receiver stream. If its process still has an older choice
+            # (restart pending), or WirePlumber restored a target from someone
+            # moving it elsewhere while we follow the default, put it right.
+            restored = stream_targets.get(stream_id)
+            if self._restart_pending or (not self._output_target and restored not in (None, -1, "-1")):
+                self._move_stream(stream_id, self._output_target)
+        self._stream_id = stream_id
+
+        if (not self._pipewire_ok or sinks != self._sinks or default_sink != self._default_sink):
+            self._pipewire_ok = True
+            self._sinks = sinks
+            self._default_sink = default_sink
+            self.outputsChanged.emit()
+
+    @staticmethod
+    def _move_stream(stream_id, target):
+        # By node.name, or -1 for "the default": WirePlumber then moves the stream
+        # without remembering a per-app override that could outlive our choice.
+        proc = QProcess()
+        proc.setProgram("pw-metadata")
+        proc.setArguments(["-n", "default", "--", str(stream_id), "target.object", target or "-1"])
+        proc.setStandardOutputFile(QProcess.nullDevice())
+        proc.startDetached()
+
+    @pyqtSlot(str)
+    def setOutput(self, name):
+        if name == self._output_target:
+            return
+        label = next((s["description"] for s in self._sinks if s["name"] == name), "")
+        try:
+            _write_sink_target(name, label)
+        except OSError as err:
+            self.errorOccurred.emit(f"Could not save the output choice: {err}")
+            return
+        self._output_target, self._output_label = name, label if name else ""
+        self.outputsChanged.emit()
+
+        if self._stream_id is not None:
+            self._move_stream(self._stream_id, name)
+        if self._unit_state == "active":
+            self._restart_pending = name != self._running_target
+            self._apply_pending_restart()
+        else:
+            self._running_target = name  # picked up whenever it next starts
+
+    def _apply_pending_restart(self):
+        # Restarting drops a connected sender, so wait until the session is over.
+        if (self._restart_pending and not self._state["active"]
+                and self._state["playbackStatus"] != "Playing"):
+            self._restart_pending = False
+            self._manage_units("RestartUnit", (RECEIVER_UNIT,))
 
     # ---- actions -------------------------------------------------------
 
@@ -268,6 +505,8 @@ class Receiver(QObject):
             self.errorOccurred.emit(f"Could not disconnect: {err}")
 
     def _manage_units(self, method, units):
+        if method in ("StartUnit", "RestartUnit"):
+            self._running_target = self._output_target
         try:
             for unit in units:
                 self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER, method, unit, "replace")
@@ -290,11 +529,7 @@ class Receiver(QObject):
 
     @pyqtSlot()
     def openConfig(self):
-        # The packaged user service seeds the per-user file from /etc on first
-        # start; do the same here so settings can be edited before that.
-        if not CONFIG_FILE.exists() and SYSTEM_CONFIG_FILE.exists():
-            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(SYSTEM_CONFIG_FILE, CONFIG_FILE)
+        _ensure_user_config()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(CONFIG_FILE)))
 
 

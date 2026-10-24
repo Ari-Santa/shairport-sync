@@ -1,3 +1,13 @@
+shairport-sync-desktop (5.6.1-2) trixie; urgency=medium
+
+  * AirPlay Receiver: add an Output picker. "Follow System" keeps AirPlay
+    audio on the system default output; any other choice pins it to that
+    device. Playing streams move immediately through PipeWire metadata; the
+    saved pipewire.sink_target is applied by restarting the receiver once
+    no sender is connected.
+
+ -- Ari-Santa <apeach@live.no>  Sat, 24 Oct 2026 20:50:22 +0200
+
 shairport-sync-desktop (5.6.1-1) trixie; urgency=medium
 
   * Initial release: Shairport Sync 5.6.1 built for AirPlay 2 with NQPTP 1.2.9,

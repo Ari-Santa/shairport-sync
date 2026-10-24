@@ -4,6 +4,12 @@ A small Kirigami/PyQt6 window that shows what Shairport Sync is playing (cover a
 title, artist, album, progress, the sending device and audio formats) and lets you
 play/pause, skip, change volume, disconnect the sender, and start or stop the receiver.
 
+With the PipeWire backend, the **Output** picker at the bottom chooses where AirPlay
+audio plays: **Follow System** (the default output, moving with it when you change it
+in Plasma) or a specific device. The choice is saved as `pipewire.sink_target` in your
+settings. A stream that is playing moves immediately; the receiver itself restarts to
+pick up the new setting only once nothing is connected, so senders aren't dropped.
+
 It talks to shairport-sync over D-Bus and controls the receiver through
 `systemd --user`, so it is meant for a per-user install with
 `shairport-sync.service` and `nqptp.service` as user units.
