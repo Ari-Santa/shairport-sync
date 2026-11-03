@@ -14,29 +14,41 @@ It talks to shairport-sync over D-Bus and controls the receiver through
 `systemd --user`, so it is meant for a per-user install with
 `shairport-sync.service` and `nqptp.service` as user units.
 
-## Install the .deb (Debian 13, amd64)
+## Install the packages
 
 The `shairport-sync-desktop` package from this fork's
 [releases](https://github.com/Ari-Santa/shairport-sync/releases) installs the
 whole receiver: Shairport Sync built for AirPlay 2, NQPTP, this app, and the
 systemd user services.
 
+Debian 13 (amd64):
+
 ```
-sudo apt install ./shairport-sync-desktop_5.6.1-1_amd64.deb
+sudo apt install ./shairport-sync-desktop_5.6.2-1_amd64.deb
+```
+
+Fedora 45 (x86_64), no extra repositories needed:
+
+```
+sudo dnf install ./shairport-sync-desktop-5.6.2-1.fc45.x86_64.rpm
 ```
 
 The receiver starts right away in your session and at every login. Your
 settings are in `~/.config/shairport-sync/shairport-sync.conf` (copied from
 `/etc/shairport-sync.conf` on first start); open them from the app's menu with
-"Edit Settings…". The package replaces Debian's own `shairport-sync`.
+"Edit Settings…". The package replaces the distribution's own `shairport-sync`.
 
-To build the package yourself, from a clone with submodules
+To build the packages yourself, from a clone with submodules
 (`git clone --recurse-submodules …`):
 
 ```
-sudo apt build-dep ./
+sudo apt build-dep ./              # Debian: once
 dpkg-buildpackage -b -us -uc
+rpm/build-rpm.sh 45                # Fedora 45, in a podman container
 ```
+
+Both put the packages in the directory above the source tree. The Debian and
+RPM packaging share the user services and default settings in `packaging/`.
 
 ## Install from source
 

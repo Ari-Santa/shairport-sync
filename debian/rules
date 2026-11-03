@@ -38,19 +38,10 @@ override_dh_auto_install:
 	rm -r $(PKG)/dbus-policy-unused
 	dh_auto_install -Dnqptp
 
-	# Default settings for a desktop session receiver.
-	sed -i \
-		-e 's|^//\toutput_backend = "alsa";|\toutput_backend = "pipewire";|' \
-		-e 's|^//\tdbus_service_bus = "system";|\tdbus_service_bus = "session";|' \
-		-e 's|^//\tmpris_service_bus = "system";|\tmpris_service_bus = "session";|' \
-		-e 's|^//\tenabled = "yes"; // set this to yes to get Shairport Sync to solicit metadata|\tenabled = "yes"; // set this to yes to get Shairport Sync to solicit metadata|' \
-		-e 's|^//\tinclude_cover_art = "yes";|\tinclude_cover_art = "yes";|' \
-		$(PKG)/etc/shairport-sync.conf
-	test $$(grep -c -P '^\t(output_backend = "pipewire"|dbus_service_bus = "session"|mpris_service_bus = "session"|enabled = "yes"|include_cover_art = "yes")' \
-		$(PKG)/etc/shairport-sync.conf) -eq 5
+	sh packaging/apply-desktop-defaults.sh $(PKG)/etc/shairport-sync.conf
 
-	install -D -m 0644 debian/shairport-sync.user-unit $(PKG)/usr/lib/systemd/user/shairport-sync.service
-	install -D -m 0644 debian/nqptp.user-unit $(PKG)/usr/lib/systemd/user/nqptp.service
+	install -D -m 0644 packaging/shairport-sync.service $(PKG)/usr/lib/systemd/user/shairport-sync.service
+	install -D -m 0644 packaging/nqptp.service $(PKG)/usr/lib/systemd/user/nqptp.service
 
 	install -D -m 0755 gui/shairport-sync-gui $(PKG)$(GUI_DIR)/shairport-sync-gui
 	install -D -m 0644 gui/qml/Main.qml $(PKG)$(GUI_DIR)/qml/Main.qml
