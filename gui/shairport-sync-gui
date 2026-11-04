@@ -52,6 +52,17 @@ SINK_TARGET_VALUE_RE = re.compile(r'^\s*sink_target\s*=\s*"((?:[^"\\]|\\.)*)"\s*
 LABEL_MARKER = "AirPlay Receiver: "
 OUTPUT_BACKEND_RE = re.compile(r'^\s*output_backend\s*=\s*"([^"]*)"')
 
+# pipewire.mixer_type = "sink" makes the sender's volume control set the output
+# device's own volume (its hardware mixer where it has one) instead of
+# shairport-sync attenuating the audio in software. The stock config has no
+# mixer_type line, so "off" is written as a commented-out line.
+MIXER_TYPE_ON_LINE = ('\tmixer_type = "sink"; // AirPlay Receiver: the sender\'s volume control '
+                      'sets the output device\'s volume.\n')
+MIXER_TYPE_OFF_LINE = ('//\tmixer_type = "sink"; // Set to "sink" to make the sender\'s volume control '
+                       'set the output device\'s volume instead of attenuating the audio in software.\n')
+MIXER_TYPE_LINE_RE = re.compile(r'^\s*(//)?\s*mixer_type\s*=')
+MIXER_TYPE_VALUE_RE = re.compile(r'^\s*mixer_type\s*=\s*"([^"]*)"')
+
 
 def _first(value):
     """MPRIS lists (e.g. xesam:artist) are shown joined; scalars as-is."""
@@ -90,36 +101,29 @@ def _section_bounds(lines, name):
     return start, end
 
 
-def _read_sink_target():
-    """(node.name, label) from pipewire.sink_target; ("", "") means follow the default."""
+def _match_pipewire_setting(value_re):
+    """The first match of value_re in the pipewire section, or None."""
     lines = _config_lines()
     bounds = _section_bounds(lines, "pipewire")
     if bounds:
         for line in lines[bounds[0]:bounds[1]]:
-            match = SINK_TARGET_VALUE_RE.match(line)
+            match = value_re.match(line)
             if match:
-                comment = match.group(2)
-                label = comment.split(LABEL_MARKER, 1)[1].strip() if LABEL_MARKER in comment else ""
-                return match.group(1).replace('\\"', '"').replace("\\\\", "\\"), label
-    return "", ""
+                return match
+    return None
 
 
-def _write_sink_target(name, label):
+def _write_pipewire_line(line_re, new_line):
+    """Replace the pipewire-section line matching line_re (set or commented out)
+    with new_line, or add new_line at the top of the section."""
     _ensure_user_config()
     lines = CONFIG_FILE.read_text().splitlines(keepends=True)
-    if name:
-        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
-        label = " ".join(label.split())
-        new_line = f'\tsink_target = "{escaped}"; // {LABEL_MARKER}{label}\n'
-    else:
-        new_line = SINK_TARGET_DEFAULT_LINE
-
     bounds = _section_bounds(lines, "pipewire")
     if bounds is None:
         lines += ["\npipewire =\n", "{\n", new_line, "};\n"]
     else:
         start, end = bounds
-        existing = next((i for i in range(start, end) if SINK_TARGET_LINE_RE.match(lines[i])), None)
+        existing = next((i for i in range(start, end) if line_re.match(lines[i])), None)
         if existing is not None:
             lines[existing] = new_line
         else:
@@ -129,6 +133,35 @@ def _write_sink_target(name, label):
     tmp = CONFIG_FILE.with_suffix(".conf.tmp")
     tmp.write_text("".join(lines))
     os.replace(tmp, CONFIG_FILE)
+
+
+def _read_sink_target():
+    """(node.name, label) from pipewire.sink_target; ("", "") means follow the default."""
+    match = _match_pipewire_setting(SINK_TARGET_VALUE_RE)
+    if match is None:
+        return "", ""
+    comment = match.group(2)
+    label = comment.split(LABEL_MARKER, 1)[1].strip() if LABEL_MARKER in comment else ""
+    return match.group(1).replace('\\"', '"').replace("\\\\", "\\"), label
+
+
+def _write_sink_target(name, label):
+    if name:
+        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+        label = " ".join(label.split())
+        new_line = f'\tsink_target = "{escaped}"; // {LABEL_MARKER}{label}\n'
+    else:
+        new_line = SINK_TARGET_DEFAULT_LINE
+    _write_pipewire_line(SINK_TARGET_LINE_RE, new_line)
+
+
+def _read_device_volume():
+    match = _match_pipewire_setting(MIXER_TYPE_VALUE_RE)
+    return match is not None and match.group(1).strip().lower() == "sink"
+
+
+def _write_device_volume(enabled):
+    _write_pipewire_line(MIXER_TYPE_LINE_RE, MIXER_TYPE_ON_LINE if enabled else MIXER_TYPE_OFF_LINE)
 
 
 def _uses_pipewire_backend():
@@ -148,6 +181,7 @@ class Receiver(QObject):
     stateChanged = pyqtSignal()
     positionChanged = pyqtSignal()
     outputsChanged = pyqtSignal()
+    deviceVolumeChanged = pyqtSignal()
     errorOccurred = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -157,16 +191,19 @@ class Receiver(QObject):
         self._unit_state = "unknown"
         self._position = 0.0
 
-        # Output selection. The lasting choice is pipewire.sink_target in the
-        # user's config, which shairport-sync only reads at startup, so a change
-        # is applied by restarting it once nothing is playing. A stream that is
-        # already playing is moved straight away through PipeWire metadata.
+        # Output selection and volume mode. The lasting choices are
+        # pipewire.sink_target and pipewire.mixer_type in the user's config,
+        # which shairport-sync only reads at startup, so a change is applied by
+        # restarting it once nothing is playing. A stream that is already
+        # playing is moved to a new output straight away through PipeWire
+        # metadata.
         self._pipewire_ok = False
         self._sinks = []
         self._default_sink = ""
         self._stream_id = None
         self._output_target, self._output_label = _read_sink_target()
-        self._running_target = self._output_target  # what the receiver process started with
+        self._device_volume = _read_device_volume()
+        self._running_settings = self._settings()  # what the receiver process started with
         self._restart_pending = False
 
         self._pw_dump = QProcess(self)
@@ -279,6 +316,14 @@ class Receiver(QObject):
     @pyqtProperty(str, notify=outputsChanged)
     def outputTargetLabel(self):
         return self._output_label
+
+    @pyqtProperty(bool, notify=deviceVolumeChanged)
+    def deviceVolumeAvailable(self):
+        return _uses_pipewire_backend()
+
+    @pyqtProperty(bool, notify=deviceVolumeChanged)
+    def deviceVolume(self):
+        return self._device_volume
 
     # ---- D-Bus helpers -------------------------------------------------
 
@@ -460,11 +505,33 @@ class Receiver(QObject):
 
         if self._stream_id is not None:
             self._move_stream(self._stream_id, name)
+        self._settings_changed()
+
+    @pyqtSlot(bool)
+    def setDeviceVolume(self, enabled):
+        if enabled == self._device_volume:
+            return
+        try:
+            _write_device_volume(enabled)
+        except OSError as err:
+            self.errorOccurred.emit(f"Could not save the volume setting: {err}")
+            self.deviceVolumeChanged.emit()  # puts the menu's check mark back
+            return
+        self._device_volume = enabled
+        self.deviceVolumeChanged.emit()
+        self._settings_changed()
+
+    # ---- applying settings -----------------------------------------------
+
+    def _settings(self):
+        return (self._output_target, self._device_volume)
+
+    def _settings_changed(self):
         if self._unit_state == "active":
-            self._restart_pending = name != self._running_target
+            self._restart_pending = self._settings() != self._running_settings
             self._apply_pending_restart()
         else:
-            self._running_target = name  # picked up whenever it next starts
+            self._running_settings = self._settings()  # picked up whenever it next starts
 
     def _apply_pending_restart(self):
         # Restarting drops a connected sender, so wait until the session is over.
@@ -506,7 +573,7 @@ class Receiver(QObject):
 
     def _manage_units(self, method, units):
         if method in ("StartUnit", "RestartUnit"):
-            self._running_target = self._output_target
+            self._running_settings = self._settings()
         try:
             for unit in units:
                 self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER, method, unit, "replace")

@@ -1,3 +1,15 @@
+shairport-sync-desktop (5.6.2-2) trixie; urgency=medium
+
+  * AirPlay Receiver: add "Use Device Volume" to the menu. When it is on,
+    the sender's volume control sets the output device's own volume
+    (pipewire.mixer_type = "sink") instead of turning the audio down in
+    software, so the audio keeps its full resolution at any volume. Like an
+    output change, it takes effect once no sender is connected.
+  * Add debian/build-deb.sh, which builds the package in a podman container
+    for a given release, e.g. "debian/build-deb.sh ubuntu:26.10".
+
+ -- Ari-Santa <apeach@live.no>  Wed, 04 Nov 2026 21:12:24 +0100
+
 shairport-sync-desktop (5.6.2-1) trixie; urgency=high
 
   * New upstream release 5.6.2:

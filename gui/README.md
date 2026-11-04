@@ -10,6 +10,16 @@ in Plasma) or a specific device. The choice is saved as `pipewire.sink_target` i
 settings. A stream that is playing moves immediately; the receiver itself restarts to
 pick up the new setting only once nothing is connected, so senders aren't dropped.
 
+**Use Device Volume**, in the menu, decides what the sender's volume control does.
+Off (the default), Shairport Sync turns the audio down digitally before PipeWire
+gets it, which costs resolution on a 16-bit device: about 5 bits at half volume.
+On, the sender's volume control sets the output device's own volume instead (its
+hardware mixer, where it has one), so the audio stays at full resolution at any
+volume. Other apps playing on that device get louder or quieter with it, and the
+first session after you turn it on sets the device to whatever the sender's volume
+is, so turn the sender down first. The choice is saved as `pipewire.mixer_type =
+"sink"` and, like an output change, takes effect once nothing is connected.
+
 It talks to shairport-sync over D-Bus and controls the receiver through
 `systemd --user`, so it is meant for a per-user install with
 `shairport-sync.service` and `nqptp.service` as user units.

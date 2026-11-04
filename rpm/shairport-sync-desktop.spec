@@ -1,6 +1,6 @@
 Name:           shairport-sync-desktop
 Version:        5.6.2
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        AirPlay 2 audio receiver for desktop users
 
 # Shairport Sync is MIT with BSD-3-Clause parts (ALAC, pair_ap/evrtsp);
@@ -165,6 +165,12 @@ fi
 %{_mandir}/man8/nqptp.8*
 
 %changelog
+* Wed Nov 04 2026 Ari-Santa <apeach@live.no> - 5.6.2-2
+- AirPlay Receiver: add "Use Device Volume" to the menu, so the sender's
+  volume control can set the output device's own volume
+  (pipewire.mixer_type = "sink") instead of turning the audio down in
+  software
+
 * Tue Nov 03 2026 Ari-Santa <apeach@live.no> - 5.6.2-1
 - First RPM build, for Fedora: Shairport Sync 5.6.2 for AirPlay 2, NQPTP
   1.2.9 and the AirPlay Receiver app, matching the Debian package 5.6.2-1

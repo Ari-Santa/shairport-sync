@@ -30,6 +30,22 @@ Kirigami.ApplicationWindow {
         return entries;
     }
     readonly property int outputIndex: Math.max(0, outputEntries.findIndex(e => e.name === receiver.outputTarget))
+    readonly property string outputDeviceName: (receiver.outputTarget !== "" ? receiver.outputTargetLabel
+                                                                             : receiver.defaultOutput)
+                                               || "the output device"
+
+    function toggleDeviceVolume() {
+        const enable = !receiver.deviceVolume;
+        receiver.setDeviceVolume(enable);
+        if (receiver.deviceVolume !== enable)
+            return; // not saved; the receiver reported why
+        const when = streaming ? "From the next AirPlay session, the" : "The";
+        showPassiveNotification(
+            enable ? when + " sender's volume control sets the volume of " + outputDeviceName
+                     + ". Turn the volume down on the sender before you play."
+                   : when + " sender's volume control turns the audio down digitally.",
+            "long");
+    }
 
     function formatTime(seconds) {
         const total = Math.max(0, Math.floor(seconds));
@@ -101,6 +117,24 @@ Kirigami.ApplicationWindow {
                 icon.name: "view-refresh"
                 displayHint: Kirigami.DisplayHint.AlwaysHide
                 onTriggered: root.receiver.restartReceiver()
+            },
+            Kirigami.Action {
+                id: deviceVolumeAction
+                objectName: "deviceVolumeAction"
+                text: "Use Device Volume"
+                tooltip: "Let the sender's volume control set the output device's own volume, "
+                         + "instead of turning the audio down digitally. Keeps full sound quality "
+                         + "at any volume; other apps on that device get louder or quieter with it."
+                icon.name: "audio-card"
+                displayHint: Kirigami.DisplayHint.AlwaysHide
+                visible: root.receiver.deviceVolumeAvailable
+                checkable: true
+                checked: root.receiver.deviceVolume
+                onTriggered: {
+                    root.toggleDeviceVolume();
+                    // Triggering a checkable action flips "checked" and drops the binding.
+                    checked = Qt.binding(() => root.receiver.deviceVolume);
+                }
             },
             Kirigami.Action {
                 text: "Edit Settings…"
