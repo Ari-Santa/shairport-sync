@@ -1,3 +1,96 @@
+shairport-sync-desktop (5.6.2-3) trixie; urgency=medium
+
+  * Install the desktop defaults as /etc/shairport-sync-desktop.conf and
+    make each user's settings from that. /etc/shairport-sync.conf is the
+    distribution's shairport-sync conffile: replacing that package after its
+    file was edited stopped at a conffile prompt, failed when run without a
+    terminal, and by default kept the old file, which put the receiver's
+    D-Bus and MPRIS interfaces on the system bus with ALSA output. On
+    upgrade, the old file and the stock sample are removed, or kept as
+    .dpkg-bak if they were edited.
+  * Start shairport-sync with --dbus-default-message-bus=session, so the
+    D-Bus and MPRIS interfaces are on the session bus even when a user's
+    settings name no bus.
+  * Never run the receiver or NQPTP for system accounts, such as the login
+    screen's, which advertised a receiver of their own at the login screen.
+    Only one user at a time can run the receiver, as its ports belong to the
+    whole machine; a second user's copy now stops retrying after a few
+    tries. shairport-sync no longer starts when NQPTP cannot be started,
+    instead of quietly falling back to classic AirPlay. Restarting NQPTP,
+    which systemd also does after a crash, now restarts shairport-sync with
+    it, ending a session in progress.
+  * Keep each user's cover art in a private directory under
+    $XDG_RUNTIME_DIR instead of /tmp/shairport-sync, which all users shared
+    and another local user could point elsewhere, for example at a
+    directory the receiver would then empty. Settings copied by earlier
+    versions are moved over too, unless cover_art_cache_directory was set
+    in them by hand.
+  * Add a firewalld service, airplay-receiver, that opens the receiver's
+    ports.
+  * Depend on dbus-user-session, which provides the session bus the
+    receiver's systemd user service publishes on.
+  * Reload each user's systemd manager before restarting the receiver on
+    upgrade, so changed unit files take effect, and start the receiver
+    again in open sessions after a reinstall that follows "apt remove",
+    unless the admin disabled it. Users whose systemd manager has stopped
+    are left alone instead of getting a new one started.
+  * Enable the receiver when the package replaces Ubuntu's shairport-sync,
+    whose disabled user unit of the same name kept it off, and on the
+    upgrade of a 5.6.2-2 that was left off that way, starting it in open
+    sessions too. A receiver the admin disabled stays off.
+  * Add a manual page for shairport-sync-gui, and ship the app's README as
+    README.gui.md, with upstream's README.md, as the RPM does.
+  * AirPlay Receiver: never restart the receiver while a sender is
+    connected, paused senders included, or start one that was stopped. A
+    restart still due to apply a setting is remembered when the app is
+    closed.
+  * AirPlay Receiver: read and change the output and volume settings with a
+    parser for libconfig's syntax, so settings edited by hand (":"
+    separators, a missing ";", several settings on a line, one-line groups,
+    /* */ comments, an active line under the commented-out example) no
+    longer end up with duplicate settings that stop the receiver, or with
+    changes the receiver ignores. Saving is atomic, keeps the file's
+    permissions, owner and symlinks, and refuses a read-only file or one
+    with a syntax error, naming the line. Bytes that aren't UTF-8 no longer
+    stop the app from starting, output names containing "${" are saved so
+    shairport-sync takes them literally, and output_backend and mixer_type
+    are matched ignoring case, as shairport-sync does.
+  * AirPlay Receiver: pick up output and volume settings changed in the
+    file by hand, and a receiver that was still starting when the app
+    first looked. Stepping through outputs with the wheel or arrow keys
+    saves and restarts once, and the picker always shows the real choice,
+    also after a failed save.
+  * AirPlay Receiver: with Use Device Volume, keep AirPlay on the device
+    whose volume the sender controls until the session ends, and warn, then
+    restart the receiver, when that device wasn't there when it started.
+    Only the receiver's own PipeWire stream is moved, and only with the
+    PipeWire backend.
+  * AirPlay Receiver: show a receiver or NQPTP that keeps failing, with a
+    Stop action, and let Start and Restart clear systemd's start limit.
+  * AirPlay Receiver: one window per user; launching it again brings that
+    window forward. A window that can't load is reported in a dialog,
+    Plasma's Qt Quick style is used only where it is installed, and the
+    footer shows whether AirPlay 2 or classic AirPlay is in use. The volume
+    slider's arrow keys step from the current volume, and Space no longer
+    blocks focused buttons.
+  * AirPlay Receiver: copy a new user's settings from
+    /etc/shairport-sync-desktop.conf, or from /etc/shairport-sync.conf
+    where that is missing (installs from source).
+  * gui/README.md: document the 5.6.2-3 packages, including Ubuntu 26.10,
+    the container builds, the new defaults file, the firewall and one
+    receiver per computer, and a from-source setup with the user units the
+    app needs. gui/install.sh checks for the Qt Quick modules the window
+    needs, says when the receiver isn't set up that way or the package's
+    app is installed too, and removes the app again with --uninstall.
+  * debian/copyright: add tinyhttp (BSD-2-Clause, linked in), pair_ap and
+    the other third-party files, the GPL-2 NQPTP header, and the packaging/
+    and rpm/ directories.
+  * build-deb.sh: Ctrl-C now stops the build and removes the container and
+    the temporary copy of the tree.
+  * Ignore debian/autoreconf.before and debian/autoreconf.after in git.
+
+ -- Ari-Santa <apeach@live.no>  Thu, 05 Nov 2026 12:43:22 +0100
+
 shairport-sync-desktop (5.6.2-2) trixie; urgency=medium
 
   * AirPlay Receiver: add "Use Device Volume" to the menu. When it is on,

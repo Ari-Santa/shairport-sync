@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# postinst starts the receiver in open sessions on an install but only
+# restarts it on an upgrade. A reinstall after "apt remove" reaches postinst
+# with the removed version as $2, just like an upgrade, so mark installs
+# here, where dpkg still tells the two apart.
+if [ "$1" = "install" ] && [ -z "$DPKG_ROOT" ]; then
+    touch /run/shairport-sync-desktop.install 2>/dev/null || true
+fi
+
+#DEBHELPER#
+
+exit 0

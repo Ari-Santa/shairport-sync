@@ -1,0 +1,14 @@
+# rpmlint filters for shairport-sync-desktop: false positives, and upstream
+# text that is not a packaging problem. Check the binary and source RPMs that
+# rpm/build-rpm.sh makes together: some filters apply to only one of them, and
+# rpmlint reports a filter that matches nothing as an error.
+#   rpmlint -r rpm/shairport-sync-desktop.rpmlintrc ../shairport-sync-desktop-VERSION-RELEASE.*.rpm
+
+# File and command names in %description (shairport-sync.conf, firewall-cmd,
+# systemd).
+addFilter("spelling-error \('(conf|cmd|systemd)',")
+# nqptp/LICENSE, shipped as LICENSE, is upstream's copy of the GPL-2.0 text,
+# with the FSF's old postal address.
+addFilter("incorrect-fsf-address /usr/share/licenses/shairport-sync-desktop/LICENSE$")
+# rpm/build-rpm.sh makes Source0 from the git tree, so it has no URL.
+addFilter("invalid-url Source0: shairport-sync-desktop-[0-9.]+\.tar\.gz$")

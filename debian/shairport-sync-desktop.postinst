@@ -11,21 +11,59 @@ if [ "$1" = "configure" ]; then
     fi
 fi
 
+# Ubuntu's shairport-sync ships a user unit of the same name, disabled.
+# deb-systemd-helper keeps its record of that after this package replaces it,
+# and the code below then leaves the receiver off. This package always enables
+# the unit, and deb-systemd-helper keeps a mark of each link it has enabled, so
+# a record without that mark is the replaced package's: drop it, also on an
+# upgrade, as up to 5.6.2-2 the record was kept. A receiver that was enabled
+# and then disabled by the admin keeps its mark and stays off.
+repaired=
+if [ "$1" = "configure" ] && [ -z "$DPKG_ROOT" ] &&
+        deb-systemd-helper --user debian-installed 'shairport-sync.service' &&
+        [ ! -e /var/lib/systemd/deb-systemd-user-helper-enabled/default.target.wants/shairport-sync.service ]; then
+    deb-systemd-helper --user purge 'shairport-sync.service' >/dev/null || true
+    repaired=1
+fi
+
 #DEBHELPER#
 
 # dh_installsystemduser only enables the receiver for future logins. Start it
 # (or restart it, on upgrade) in the sessions of users logged in right now, so
-# it works without logging out. Accounts below UID 1000, such as the login
-# screen's, are skipped.
-if [ "$1" = "configure" ] && [ -z "$DPKG_ROOT" ] && command -v loginctl >/dev/null 2>&1; then
-    loginctl list-users --no-legend 2>/dev/null | while read -r uid user _; do
-        [ "$uid" -ge 1000 ] 2>/dev/null || continue
-        if [ -z "$2" ]; then
-            systemctl --user --machine="$user@" start shairport-sync.service >/dev/null 2>&1 || true
-        else
-            systemctl --user --machine="$user@" try-restart nqptp.service shairport-sync.service >/dev/null 2>&1 || true
-        fi
-    done
+# it works without logging out. The units never run for system accounts, such
+# as the login screen's, so accounts below UID 1000 are skipped. preinst
+# leaves a marker on an install, which includes a reinstall after "apt remove"
+# (prerm stopped the receiver then, so there is nothing to restart).
+if [ "$1" = "configure" ] && [ -z "$DPKG_ROOT" ]; then
+    fresh=
+    if [ -z "$2" ] || [ -e /run/shairport-sync-desktop.install ]; then
+        fresh=1
+    fi
+    rm -f /run/shairport-sync-desktop.install
+    if command -v loginctl >/dev/null 2>&1; then
+        loginctl list-users --no-legend 2>/dev/null | while read -r uid user _; do
+            [ "$uid" -ge 1000 ] 2>/dev/null || continue
+            # Only running user managers: going through --machine to a user
+            # whose manager has stopped (logged out, still listed) starts one.
+            systemctl is-active --quiet "user@$uid.service" || continue
+            # Without a reload, the user manager keeps using the unit files it
+            # loaded before, even for the restart.
+            systemctl --user --machine="$user@" daemon-reload >/dev/null 2>&1 || true
+            if [ -n "$fresh" ]; then
+                # Only where it is enabled: after "apt remove", a receiver the
+                # admin disabled is still disabled, and stays off.
+                if systemctl --user --machine="$user@" is-enabled --quiet shairport-sync.service >/dev/null 2>&1; then
+                    systemctl --user --machine="$user@" start shairport-sync.service >/dev/null 2>&1 || true
+                fi
+            elif [ -n "$repaired" ]; then
+                # Off until now (see above): start it, as on an install, or
+                # restart a receiver the user started by hand.
+                systemctl --user --machine="$user@" restart nqptp.service shairport-sync.service >/dev/null 2>&1 || true
+            else
+                systemctl --user --machine="$user@" try-restart nqptp.service shairport-sync.service >/dev/null 2>&1 || true
+            fi
+        done
+    fi
 fi
 
 exit 0

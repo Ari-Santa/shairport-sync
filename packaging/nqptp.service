@@ -3,10 +3,16 @@ Description=NQPTP -- Not Quite PTP (AirPlay 2 timing for Shairport Sync)
 Documentation=man:nqptp(8)
 After=network-online.target
 Before=shairport-sync.service
+# Like shairport-sync.service: never for system accounts, and a second
+# user's copy, which cannot get the ports, stops retrying.
+ConditionUser=!@system
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
-# /usr/bin/nqptp has cap_net_bind_service (set in postinst) for ports 319/320.
-# Started on demand by shairport-sync.service, which Wants= it.
+# /usr/bin/nqptp has cap_net_bind_service (set by the package: setcap in the
+# Debian postinst, %caps in the RPM) for ports 319/320.
+# Started on demand by shairport-sync.service, which Requires= it.
 ExecStart=/usr/bin/nqptp
 Restart=on-failure
 RestartSec=2

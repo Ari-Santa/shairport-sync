@@ -4,18 +4,90 @@ Upstream-Contact: Mike Brady <4265913+mikebrady@users.noreply.github.com>
 Source: https://github.com/mikebrady/shairport-sync
 
 Files: *
-Copyright: 2013 James Laird
+Copyright: 2011-2013 James Laird <jhl@mafipulation.org>
+           2014-2026 Mike Brady <4265913+mikebrady@users.noreply.github.com>
+           2026 the Shairport Sync contributors
+License: MIT
+
+Files: audio_alsa.c
+Copyright: 2013 Muffinman, Skaman
            2014-2026 Mike Brady
 License: MIT
-Comment: Some files carry their own notices (ALAC, tinysvcmdns, tinyhttp,
- FFTConvolver, pair_ap and others); they are listed in the LICENSES file of
- the source tree.
 
-Files: nqptp/*
+Files: mdns_dns_sd.c mdns_external.c mdns_tinysvcmdns.c
+Copyright: 2013 Paul Lietar
+           2014-2025 Mike Brady
+License: MIT
+
+Files: metadata/audio_bitrate.c
+Copyright: 2026 Leon Roy
+License: MIT
+
+Files: nqptp-shm-structures.h nqptp/*
 Copyright: 2021-2026 Mike Brady
 License: GPL-2
 
-Files: gui/* debian/*
+Files: tinyhttp/*
+Copyright: 2012 Matthew Endsley
+License: BSD-2-Clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted providing that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.
+
+Files: pair_ap/*
+Copyright: 2022 Espen Jürgensen
+License: MIT
+Comment: Adapted from ap2-sender by ViktoriiaKh, with SRP code adapted from
+ csrp by Tom Cocagne and TLV helpers adapted from esp-homekit by Maxim
+ Kulkin.
+
+Files: pair_ap/evrtsp/*
+Copyright: 2010 Julien BLACHE <jb@jblache.org>
+           2002-2006 Niels Provos <provos@citi.umich.edu>
+License: BSD-3-Clause
+Comment: Not compiled into this package.
+
+Files: alac.c alac.h
+Copyright: 2005 David Hammerton
+License: MIT
+Comment: Not compiled into this package.
+
+Files: tinysvcmdns.c tinysvcmdns.h
+Copyright: 2011 Darell Tan
+           2014-2025 Mike Brady
+License: BSD-3-Clause
+Comment: Not compiled into this package.
+
+Files: FFTConvolver/AudioFFT.* FFTConvolver/FFTConvolver.* FFTConvolver/Utilities.*
+Copyright: 2017 HiFi-LoFi
+License: MIT
+Comment: Not compiled into this package.
+
+Files: audio_sndio.c
+Copyright: 2013 Dimitri Sokolyuk <demon@dim13.org>
+           2017 Tobias Kortkamp <t@tobik.me>
+           2014-2025 Mike Brady
+License: ISC
+Comment: Not compiled into this package.
+
+Files: gui/* debian/* packaging/* rpm/*
 Copyright: 2026 Ari-Santa
 License: MIT
 
@@ -37,6 +109,42 @@ License: MIT
  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  SOFTWARE.
+
+License: BSD-3-Clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. The name of the author may not be used to endorse or promote products
+    derived from this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+License: ISC
+ Permission to use, copy, modify, and distribute this software for any
+ purpose with or without fee is hereby granted, provided that the above
+ copyright notice and this permission notice appear in all copies.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 License: GPL-2
  This program is free software; you can redistribute it and/or modify it

@@ -1,0 +1,47 @@
+.\" shairport-sync-gui(1) - the AirPlay Receiver app. Installed by both the
+.\" Debian and the RPM packaging.
+.TH SHAIRPORT\-SYNC\-GUI 1 "November 2026" "shairport\-sync\-desktop" "User Commands"
+.SH NAME
+shairport\-sync\-gui \- AirPlay Receiver, a now-playing window for Shairport Sync
+.SH SYNOPSIS
+.B shairport\-sync\-gui
+.SH DESCRIPTION
+.B shairport\-sync\-gui
+opens AirPlay Receiver, a window that shows what the AirPlay receiver in your
+desktop session is playing (cover art, title, artist, album, progress, the
+sending device and the audio formats) and lets you play or pause, skip, change
+the volume, disconnect the sender, and start or stop the receiver.
+.PP
+With the PipeWire backend, the Output picker chooses where AirPlay audio plays,
+and Use Device Volume, in the menu, makes the sender's volume control set the
+output device's own volume. Both are saved in your settings and take effect
+once no sender is connected, as the receiver restarts to apply them.
+.PP
+The app reads the D-Bus and MPRIS interfaces that
+.BR shairport\-sync (1)
+publishes on the session bus, and starts and stops the receiver through the
+systemd user units
+.I shairport\-sync.service
+and
+.IR nqptp.service .
+Each user gets one window: starting the app again brings it to the front.
+.PP
+The app has no options of its own, but takes Qt's standard ones, such as
+.BR \-platform .
+.SH FILES
+.TP
+.I ~/.config/shairport\-sync/shairport\-sync.conf
+Your receiver settings. Edit Settings... in the menu opens them; the app
+itself changes only the output and volume settings in them.
+.TP
+.I /etc/shairport\-sync\-desktop.conf
+The default settings, from which yours are made the first time the receiver or
+the app needs them.
+.SH SEE ALSO
+.BR shairport\-sync (1),
+.BR nqptp (8),
+.BR systemctl (1),
+.BR journalctl (1)
+.PP
+The app's README, in
+.IR /usr/share/doc/shairport\-sync\-desktop .

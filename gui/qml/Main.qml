@@ -10,8 +10,11 @@ Kirigami.ApplicationWindow {
     required property var receiver
 
     readonly property bool running: receiver.unitState === "active"
-    readonly property bool streaming: running && receiver.online
-                                      && (receiver.active || receiver.playbackStatus !== "Stopped")
+    // systemd keeps restarting it after it stopped by itself.
+    readonly property bool failing: receiver.unitState === "failing"
+    readonly property bool stoppable: running || failing || receiver.unitState === "activating"
+    // A sender is connected, playing or paused (the receiver's restarts wait for this to end).
+    readonly property bool streaming: running && receiver.inSession
     readonly property bool playing: receiver.playbackStatus === "Playing"
     readonly property bool hasTrack: streaming && receiver.title !== ""
     readonly property string speakerName: receiver.receiverName || "this computer"
@@ -68,11 +71,23 @@ Kirigami.ApplicationWindow {
         function onErrorOccurred(message) {
             root.showPassiveNotification(message, "long");
         }
+        function onNoticeOccurred(message) {
+            root.showPassiveNotification(message, "long");
+        }
     }
 
     Shortcut {
-        sequences: ["Media Play", "Media Pause", "Toggle Media Play/Pause", "Space"]
+        sequences: ["Media Play", "Media Pause", "Toggle Media Play/Pause"]
         enabled: root.streaming
+        onActivated: root.receiver.playPause()
+    }
+    // Space plays and pauses too, except on a control the keyboard focus was
+    // moved to (with Tab), which Space activates. A control keeps the focus
+    // after a click, but not Space. (An open list or menu blocks shortcuts.)
+    Shortcut {
+        sequence: "Space"
+        enabled: root.streaming && !(root.activeFocusItem && root.activeFocusItem.visible
+                                     && root.activeFocusItem.visualFocus === true)
         onActivated: root.receiver.playPause()
     }
     Shortcut {
@@ -86,11 +101,35 @@ Kirigami.ApplicationWindow {
         onActivated: root.receiver.previous()
     }
 
+    // Qt Quick leaves the focus on a control that is hidden, and keys still
+    // reach it there, so the page takes the focus back.
+    function takeFocusFromHidden() {
+        let item = activeFocusItem;
+        while (item && !item.visible && item !== page) {
+            item.focus = false; // else the page hands it straight back
+            page.forceActiveFocus();
+            item = activeFocusItem;
+        }
+    }
+    onActiveFocusItemChanged: takeFocusFromHidden()
+    Connections {
+        target: root.activeFocusItem
+        function onVisibleChanged() {
+            root.takeFocusFromHidden();
+        }
+    }
+
     Kirigami.Action {
         id: startAction
         text: "Start Receiver"
         icon.name: "media-playback-start"
         onTriggered: root.receiver.startReceiver()
+    }
+    Kirigami.Action {
+        id: stopAction
+        text: "Stop Receiver"
+        icon.name: "system-shutdown"
+        onTriggered: root.receiver.stopReceiver()
     }
 
     pageStack.initialPage: Kirigami.Page {
@@ -98,6 +137,15 @@ Kirigami.ApplicationWindow {
 
         title: "AirPlay Receiver"
         padding: Kirigami.Units.largeSpacing * 2
+        focus: true
+
+        // Space that a control with the keyboard focus passes on (the volume
+        // slider does) plays and pauses as well; see the Space Shortcut.
+        Keys.onSpacePressed: event => {
+            event.accepted = root.streaming;
+            if (root.streaming)
+                root.receiver.playPause();
+        }
 
         actions: [
             Kirigami.Action {
@@ -108,9 +156,9 @@ Kirigami.ApplicationWindow {
                 onTriggered: root.receiver.disconnectSender()
             },
             Kirigami.Action {
-                text: root.running ? "Stop Receiver" : "Start Receiver"
-                icon.name: root.running ? "system-shutdown" : "media-playback-start"
-                onTriggered: root.running ? root.receiver.stopReceiver() : root.receiver.startReceiver()
+                text: root.stoppable ? "Stop Receiver" : "Start Receiver"
+                icon.name: root.stoppable ? "system-shutdown" : "media-playback-start"
+                onTriggered: root.stoppable ? root.receiver.stopReceiver() : root.receiver.startReceiver()
             },
             Kirigami.Action {
                 text: "Restart Receiver"
@@ -179,13 +227,19 @@ Kirigami.ApplicationWindow {
             anchors.centerIn: parent
             width: parent.width - Kirigami.Units.gridUnit * 2
             visible: !root.running
-            icon.name: root.receiver.unitState === "failed" ? "dialog-error" : "network-offline"
-            text: root.receiver.unitState === "failed" ? "The receiver has stopped working"
-                                                        : "The receiver is turned off"
-            explanation: root.receiver.unitState === "failed"
-                         ? "Check its log with “journalctl --user -u shairport-sync”, then start it again."
+
+            readonly property bool failed: root.receiver.unitState === "failed"
+            readonly property string logCommand: "“journalctl --user -u " + root.receiver.failedUnit + "”"
+
+            icon.name: root.failing || failed ? "dialog-error" : "network-offline"
+            text: root.failing ? "The receiver stopped unexpectedly"
+                  : failed ? "The receiver has stopped working"
+                  : "The receiver is turned off"
+            explanation: root.failing ? "It is being started again. If this doesn't go away, check its log with "
+                                        + logCommand + "."
+                         : failed ? "Check its log with " + logCommand + ", then start it again."
                          : "Start it to make this computer available as an AirPlay speaker."
-            helpfulAction: startAction
+            helpfulAction: root.failing ? stopAction : startAction
         }
 
         Kirigami.PlaceholderMessage {
@@ -221,6 +275,8 @@ Kirigami.ApplicationWindow {
                 Layout.maximumWidth: nowPlaying.width
                 checkable: false
                 closable: false
+                // It only shows who is streaming, so it isn't a Tab stop.
+                focusPolicy: Qt.NoFocus
                 icon.name: "smartphone"
                 text: root.receiver.clientName ? "Streaming from " + root.receiver.clientName
                                                : "Streaming to " + root.speakerName
@@ -402,9 +458,13 @@ Kirigami.ApplicationWindow {
                     from: 0
                     to: 1
                     onMoved: root.receiver.setVolume(value)
+                    // While pressed (also for a moment on each arrow key) the slider
+                    // keeps its own value; it mustn't go back to the one it had when
+                    // the binding last took over.
                     Binding on value {
                         value: root.receiver.volume
                         when: !volumeSlider.pressed
+                        restoreMode: Binding.RestoreNone
                     }
                 }
                 Kirigami.Icon {
@@ -430,11 +490,22 @@ Kirigami.ApplicationWindow {
         footer: ColumnLayout {
             spacing: 0
 
+            Kirigami.InlineMessage {
+                Layout.fillWidth: true
+                Layout.margins: Kirigami.Units.smallSpacing
+                type: Kirigami.MessageType.Warning
+                text: root.receiver.deviceVolumeWarning
+                visible: text !== "" && root.running
+            }
+
             QQC2.Label {
                 Layout.fillWidth: true
                 padding: Kirigami.Units.smallSpacing
                 visible: root.receiver.version !== "" && !root.streaming
-                text: "Shairport Sync " + root.receiver.version + " · AirPlay 2"
+                // What the receiver runs as: it falls back to classic AirPlay without NQPTP.
+                text: "Shairport Sync " + root.receiver.version
+                      + (root.receiver.protocol === "AirPlay 2" ? " · AirPlay 2"
+                         : root.receiver.protocol !== "" ? " · Classic AirPlay" : "")
                 horizontalAlignment: Text.AlignHCenter
                 font: Kirigami.Theme.smallFont
                 opacity: 0.5
@@ -466,10 +537,21 @@ Kirigami.ApplicationWindow {
                         model: root.outputEntries
                         textRole: "label"
                         valueRole: "name"
-                        currentIndex: root.outputIndex
+                        // A new model resets currentIndex to 0, so this is worked out
+                        // again then too, not only when outputIndex changes.
+                        currentIndex: { model; return root.outputIndex; }
                         // The list says which device the system default is; the field stays short.
                         displayText: currentIndex === 0 ? "Follow System" : currentText
-                        onActivated: root.receiver.setOutput(currentValue)
+                        onActivated: {
+                            // A pick from the open list is saved at once; steps with the
+                            // wheel or the arrow keys once the picker stays on one.
+                            root.receiver.setOutput(currentValue);
+                            if (popup.visible)
+                                root.receiver.commitOutput();
+                            // Show the receiver's choice, e.g. the saved one again if
+                            // saving failed.
+                            currentIndex = Qt.binding(() => { model; return root.outputIndex; });
+                        }
 
                         QQC2.ToolTip.text: currentText
                         QQC2.ToolTip.visible: hovered && !popup.visible

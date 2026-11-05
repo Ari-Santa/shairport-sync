@@ -2,13 +2,44 @@
 Description=Shairport Sync - AirPlay 2 Audio Receiver
 Documentation=man:shairport-sync(1)
 After=sound.target nqptp.service pipewire.service wireplumber.service
-Wants=nqptp.service
+# When NQPTP cannot be started, do not start either, rather than quietly
+# falling back to classic AirPlay. This also stops and restarts the receiver
+# with NQPTP, including when systemd restarts NQPTP after a crash: a session
+# in progress ends then, but it could not go on anyway, as the new NQPTP
+# knows none of its timing peers.
+Requires=nqptp.service
+# The AirPlay ports belong to the whole machine, so only one user at a time
+# can run the receiver. System accounts, such as the login screen's, never
+# run it, and the start limit stops a second user's copy retrying forever.
+ConditionUser=!@system
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
-# Each user gets an editable copy of the system-wide defaults.
+# Each user gets an editable copy of the desktop defaults.
 ExecStartPre=/usr/bin/mkdir -p %E/shairport-sync
-ExecStartPre=-/usr/bin/cp -n /etc/shairport-sync.conf %E/shairport-sync/shairport-sync.conf
-ExecStart=/usr/bin/shairport-sync -c %E/shairport-sync/shairport-sync.conf
+ExecStartPre=-/usr/bin/cp -n /etc/shairport-sync-desktop.conf %E/shairport-sync/shairport-sync.conf
+# Cover art goes to a private directory in the user's runtime directory, not
+# to the default one in /tmp that all users share: the stock line is replaced
+# (only while it is there), which also covers copies made by earlier versions.
+# Where the user has set cover_art_cache_directory themselves (anywhere but
+# in a //, # or /* */ comment that starts a line), their setting is left to
+# apply instead: a second one would be a duplicate setting, which stops
+# shairport-sync from starting.
+ExecStartPre=-/bin/sh -c 'grep -q "$$2" "$$1" || exit 0; \
+    sed -E -e :a -e "s|^[[:space:]]*/[*][^*]*[*]+([^/*][^*]*[*]+)*/||" -e ta \
+        -e "s|^[[:space:]]*/[*]|&|" -e T -e N -e ba "$$1" | \
+    grep -v -e "^[[:space:]]*//" -e "^[[:space:]]*#" | \
+    grep -q "cover_art_cache_directory[[:space:]]*[=:]" && exit 0; \
+    exec sed -i --follow-symlinks "s|$$2|$$3|" "$$1"' sh \
+    %E/shairport-sync/shairport-sync.conf \
+    "^//\tcover_art_cache_directory = \"/tmp/shairport-sync/.cache/coverart\";" \
+    "\tcover_art_cache_directory = \"%t/shairport-sync/coverart\";"
+# The D-Bus and MPRIS interfaces go on the session bus unless the config
+# names a bus.
+ExecStart=/usr/bin/shairport-sync --dbus-default-message-bus=session -c %E/shairport-sync/shairport-sync.conf
+RuntimeDirectory=shairport-sync
+RuntimeDirectoryMode=0700
 Restart=on-failure
 RestartSec=2
 

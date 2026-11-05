@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>AirPlay Receiver</short>
+  <description>Shairport Sync AirPlay 2 audio receiver from shairport-sync-desktop: PTP timing for NQPTP (UDP 319 and 320), AirPlay 2 control (TCP 7000), the dynamic ports the audio streams use (TCP and UDP 32768-60999), classic AirPlay (TCP 5000, UDP 6001-6010) and mDNS, so senders can find the receiver.</description>
+  <port protocol="udp" port="319"/>
+  <port protocol="udp" port="320"/>
+  <port protocol="tcp" port="7000"/>
+  <port protocol="tcp" port="32768-60999"/>
+  <port protocol="udp" port="32768-60999"/>
+  <port protocol="tcp" port="5000"/>
+  <port protocol="udp" port="6001-6010"/>
+  <include service="mdns"/>
+</service>

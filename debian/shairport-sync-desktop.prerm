@@ -6,6 +6,9 @@ set -e
 if [ "$1" = "remove" ] && command -v loginctl >/dev/null 2>&1; then
     loginctl list-users --no-legend 2>/dev/null | while read -r uid user _; do
         [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        # Only running user managers: going through --machine to a user whose
+        # manager has stopped (logged out, still listed) starts one.
+        systemctl is-active --quiet "user@$uid.service" || continue
         systemctl --user --machine="$user@" stop shairport-sync.service nqptp.service >/dev/null 2>&1 || true
     done
 fi

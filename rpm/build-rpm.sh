@@ -30,8 +30,18 @@ fi
 command -v podman >/dev/null 2>&1 || { echo "[FAIL] podman is needed." >&2; exit 1; }
 
 WORK=$(mktemp -d)
-cleanup() { [ -n "$WORK" ] && [ -d "$WORK" ] && rm -r -- "$WORK"; }
+CONTAINER=shairport-sync-desktop-build-$$
+cleanup() {
+    podman rm -f -t 0 "$CONTAINER" >/dev/null 2>&1 || true
+    [ -n "$WORK" ] && [ -d "$WORK" ] && rm -r -- "$WORK"
+}
 trap cleanup EXIT
+# dash skips the EXIT trap when a signal kills it, so turn the signals into
+# an exit. podman does not pass them on (--sig-proxy=false): it returns at
+# once, and cleanup removes the container, which is still building.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$WORK/SOURCES"
 
 {
@@ -43,7 +53,7 @@ tar -C "$TOP" -czf "$WORK/SOURCES/shairport-sync-desktop-$VERSION.tar.gz" \
 cp "$SPEC" "$WORK/"
 
 echo "[..] Building shairport-sync-desktop $VERSION on Fedora $FEDORA..."
-podman run --rm -v "$WORK:/work:Z" "registry.fedoraproject.org/fedora:$FEDORA" sh -ec '
+podman run --rm --sig-proxy=false --name "$CONTAINER" -v "$WORK:/work:Z" "registry.fedoraproject.org/fedora:$FEDORA" sh -ec '
     dnf -y -q install rpm-build "dnf-command(builddep)" >/dev/null
     dnf -y -q builddep /work/shairport-sync-desktop.spec >/dev/null
     rpmbuild -ba --define "_topdir /work" /work/shairport-sync-desktop.spec

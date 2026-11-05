@@ -32,8 +32,18 @@ fi
 command -v podman >/dev/null 2>&1 || { echo "[FAIL] podman is needed." >&2; exit 1; }
 
 WORK=$(mktemp -d)
-cleanup() { [ -n "$WORK" ] && [ -d "$WORK" ] && rm -r -- "$WORK"; }
+CONTAINER=shairport-sync-desktop-build-$$
+cleanup() {
+    podman rm -f -t 0 "$CONTAINER" >/dev/null 2>&1 || true
+    [ -n "$WORK" ] && [ -d "$WORK" ] && rm -r -- "$WORK"
+}
 trap cleanup EXIT
+# dash skips the EXIT trap when a signal kills it, so turn the signals into
+# an exit. podman does not pass them on (--sig-proxy=false): it returns at
+# once, and cleanup removes the container, which is still building.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$WORK/src" "$WORK/out"
 
 {
@@ -43,7 +53,7 @@ mkdir -p "$WORK/src" "$WORK/out"
 tar -C "$TOP" -cf - -T "$WORK/files" | tar -C "$WORK/src" -xf -
 
 echo "[..] Building shairport-sync-desktop in $IMAGE..."
-podman run --rm -v "$WORK:/work:Z" "$IMAGE" sh -ec '
+podman run --rm --sig-proxy=false --name "$CONTAINER" -v "$WORK:/work:Z" "$IMAGE" sh -ec '
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends build-essential >/dev/null

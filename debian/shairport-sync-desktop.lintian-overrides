@@ -1,0 +1,5 @@
+# The receiver is a user service. deb-systemd-invoke can neither try-restart
+# a user unit nor act in one given user's manager, so postinst and prerm call
+# "systemctl --user --machine=USER@" for each user logged in at the time.
+maintainer-script-calls-systemctl [postinst:*]
+maintainer-script-calls-systemctl [prerm:*]

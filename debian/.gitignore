@@ -7,3 +7,5 @@
 /shairport-sync-desktop/
 /shairport-sync-desktop-dbgsym/
 /tmp/
+/autoreconf.after
+/autoreconf.before

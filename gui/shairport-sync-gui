@@ -7,18 +7,24 @@ drives a Kirigami UI. It also starts and stops the receiver's systemd --user
 units (shairport-sync.service and nqptp.service).
 """
 
+import contextlib
+import errno
 import json
 import os
 import re
 import shutil
+import stat
 import sys
+import tempfile
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QProcess, QTimer, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (QCoreApplication, QObject, QProcess, QTimer, QUrl, pyqtClassInfo,
+                          pyqtProperty, pyqtSignal, pyqtSlot)
 from PyQt6.QtDBus import QDBus, QDBusConnection, QDBusMessage, QDBusServiceWatcher
-from PyQt6.QtGui import QDesktopServices, QIcon
+from PyQt6.QtGui import QDesktopServices, QIcon, QWindow
 from PyQt6.QtQml import QQmlApplicationEngine
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 HERE = Path(__file__).resolve().parent
 
@@ -35,33 +41,56 @@ SYSTEMD_SERVICE = "org.freedesktop.systemd1"
 SYSTEMD_PATH = "/org/freedesktop/systemd1"
 SYSTEMD_MANAGER = "org.freedesktop.systemd1.Manager"
 SYSTEMD_UNIT = "org.freedesktop.systemd1.Unit"
+SYSTEMD_SERVICE_IFACE = "org.freedesktop.systemd1.Service"
 RECEIVER_UNIT = "shairport-sync.service"
 TIMING_UNIT = "nqptp.service"
 
+# The app's own name on the session bus, which keeps it to one window.
+APP_SERVICE = "org.shairportsync.AirPlayReceiver"
+APP_PATH = "/"
+
+# What the running receiver process started with, kept for the app's next run
+# (the receiver only reads its settings when it starts).
+STATE_FILE = (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+              / "shairport-sync-gui/receiver.json")
+
 CONFIG_FILE = Path.home() / ".config/shairport-sync/shairport-sync.conf"
+# A new CONFIG_FILE starts as a copy of the packages' desktop defaults or, where
+# those aren't installed (a from-source install), of the system-wide config.
+DEFAULTS_CONFIG_FILE = Path("/etc/shairport-sync-desktop.conf")
 SYSTEM_CONFIG_FILE = Path("/etc/shairport-sync.conf")
 
 DBUS_TIMEOUT_MS = 1000
 OUTPUT_POLL_MS = 3000
+# A picked output is saved once the picker has stayed on it this long, so
+# stepping through the list (wheel, arrow keys) saves and applies it only once.
+OUTPUT_COMMIT_MS = 1000
+# How long after the receiver starts its PipeWire connections are taken as
+# settled, and how long it must run after an automatic restart to count as
+# working again.
+SETTLE_S = 5
+FAILING_S = 10
+# The app doesn't restart a receiver that has run for less than this, so that
+# its restarts (one per output picked while nothing plays, say) stay well
+# inside the units' start limit of 10 starts a minute.
+MIN_RUN_S = 10
+# The PipeWire client shairport-sync opens to set a sink's volume
+# (pipewire.mixer_type = "sink"); it closes it again if it can't.
+SINK_VOLUME_CLIENT = "shairport-sync-sink"
 
 # The pipewire.sink_target line as shipped (commented out = follow the system default).
 SINK_TARGET_DEFAULT_LINE = ('//\tsink_target = "<sink target name>"; // Leave this commented out '
                             'to get the sink target already chosen by the PipeWire system.\n')
-SINK_TARGET_LINE_RE = re.compile(r'^\s*(//)?\s*sink_target\s*=')
-SINK_TARGET_VALUE_RE = re.compile(r'^\s*sink_target\s*=\s*"((?:[^"\\]|\\.)*)"\s*;(.*)$')
+# Starts the comment after a sink_target written by the app, which names the output.
 LABEL_MARKER = "AirPlay Receiver: "
-OUTPUT_BACKEND_RE = re.compile(r'^\s*output_backend\s*=\s*"([^"]*)"')
 
 # pipewire.mixer_type = "sink" makes the sender's volume control set the output
 # device's own volume (its hardware mixer where it has one) instead of
 # shairport-sync attenuating the audio in software. The stock config has no
 # mixer_type line, so "off" is written as a commented-out line.
-MIXER_TYPE_ON_LINE = ('\tmixer_type = "sink"; // AirPlay Receiver: the sender\'s volume control '
-                      'sets the output device\'s volume.\n')
+MIXER_TYPE_ON_COMMENT = LABEL_MARKER + "the sender's volume control sets the output device's volume."
 MIXER_TYPE_OFF_LINE = ('//\tmixer_type = "sink"; // Set to "sink" to make the sender\'s volume control '
                        'set the output device\'s volume instead of attenuating the audio in software.\n')
-MIXER_TYPE_LINE_RE = re.compile(r'^\s*(//)?\s*mixer_type\s*=')
-MIXER_TYPE_VALUE_RE = re.compile(r'^\s*mixer_type\s*=\s*"([^"]*)"')
 
 
 def _first(value):
@@ -72,106 +101,457 @@ def _first(value):
 
 
 # ---- the user's shairport-sync.conf -------------------------------------
+#
+# shairport-sync removes the comments from its config, expands ${NAME}
+# references and parses the rest with libconfig. The settings the app reads and
+# writes are found with a small parser for libconfig's syntax, so they can be
+# laid out in any way libconfig accepts, and a write changes only the text of
+# the one setting it sets.
+
+class ConfigError(OSError):
+    """The config file can't be changed safely, e.g. because it doesn't parse."""
+
+
+class _ParseError(Exception):
+    def __init__(self, offset, message):
+        super().__init__(message)
+        self.offset = offset
+
+
+class _Group:
+    """Where the settings of a group (or of the whole file) are."""
+
+    def __init__(self, start):
+        self.start = start      # offset of the "{" (0 for the file)
+        self.end = None         # for the file, the offset its settings end at (see _TOKEN_RE)
+        self.settings = {}      # name -> _Setting
+        self.comments = []      # (start, end) of each comment between the settings
+
+
+class _Setting:
+    """Where a `name = value;` is."""
+
+    def __init__(self, start):
+        self.start = start      # offset of the name
+        self.end = start        # offset just past the value, or past its ";" or ","
+        self.strings = None     # (start, end) of each quoted piece of a string value
+        self.group = None       # the _Group of a group value
+
+
+# libconfig's tokens. Comments are kept: one can hold the label of an output,
+# or be a commented-out setting for a new setting to replace. A string or a /*
+# comment still open at the end of the file is dropped, as libconfig and
+# shairport-sync do, so the file's settings end where it starts. A ${NAME}
+# outside a string is replaced by the variable's text before libconfig sees it,
+# so it is taken as a value of some kind (one the app doesn't read).
+_TOKEN_RE = re.compile(r'''
+      (?P<space>[ \t\r\n\f]+)
+    | (?P<comment>(?://|\#)[^\n]*|/\*.*?\*/)
+    | (?P<open_comment>/\*.*)
+    | (?P<string>"(?:[^"\\]|\\.)*")
+    | (?P<open_string>"(?:[^"\\]|\\.)*\\?\Z)
+    | (?P<env>\$\{[A-Za-z_][A-Za-z0-9_]*\})
+    | (?P<include>@include\b)
+    | (?P<name>[A-Za-z*][-A-Za-z0-9_*]*)
+    | (?P<number>0[xX][0-9A-Fa-f]+L{0,2}
+        | [-+]?(?:[0-9]*\.[0-9]*(?:[eE][-+]?[0-9]+)?|[0-9]+[eE][-+]?[0-9]+|[0-9]+L{0,2}))
+    | (?P<punct>[=:;,{}()\[\]])
+    | (?P<other>.)
+''', re.VERBOSE | re.DOTALL)
+# "${NAME}" is replaced by the variable's value, "$${" by a literal "${".
+_ENV_REF_RE = re.compile(r'\$\$\{|\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
+_ESCAPE_RE = re.compile(rb'\\(?:([nrtf"\\])|[xX]([0-9A-Fa-f]{2}))')
+_ESCAPES = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"f": b"\f", b'"': b'"', b"\\": b"\\"}
+_QUOTED = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t", "\f": "\\f"}
+# A comment right after a setting, on the same line.
+_COMMENT_AFTER_RE = re.compile(r'[ \t\f]*(?:(?://|#)(?P<line>[^\n]*?)(?=\r?\n|\Z)'
+                               r'|/\*(?P<block>(?:(?!\*/)[^\n])*)\*/)')
+_LINE_END_RE = re.compile(r'[ \t\f]*(?:\r?\n|\Z)')
+_REST_OF_LINE_RE = re.compile(r'[ \t\f]*(?:(?://|#)[^\n]*)?\r?\n')
+_BLANKS_RE = re.compile(r'[ \t\f]*')
+_CONTROL_CHARS_RE = re.compile(r'[\x00-\x1f\x7f-\x9f\ud800-\udfff]')
+
+
+def _parse_config(text):
+    """The top-level settings in a config file's text, as a _Group. Raises
+    _ParseError where libconfig would reject the file's structure."""
+    tokens = [(m.lastgroup, m.start(), m.end()) for m in _TOKEN_RE.finditer(text)
+              if m.lastgroup != "space"]
+    left_open = tokens.pop() if tokens and tokens[-1][0] in ("open_string", "open_comment") else None
+    open_string = left_open[1] if left_open and left_open[0] == "open_string" else None
+    tokens.append(("end", len(text), len(text)))
+
+    def fail(i, message="syntax error"):
+        kind, start, _ = tokens[i]
+        if kind == "end" and open_string is not None:
+            start, message = open_string, "unterminated string"
+        elif kind == "end":
+            message = "unexpected end of file"
+        raise _ParseError(start, message)
+
+    def is_punct(i, chars):
+        kind, start, _ = tokens[i]
+        return kind == "punct" and text[start] in chars
+
+    def skip_comments(i, comments=None):
+        while tokens[i][0] == "comment":
+            if comments is not None:
+                comments.append(tokens[i][1:])
+            i += 1
+        return i
+
+    def parse_settings(i, group, closing):
+        # Up to the closing "}", or with closing None, to the end of the file.
+        while True:
+            i = skip_comments(i, group.comments)
+            kind, start, end = tokens[i]
+            if kind == "end" and closing is None or closing and is_punct(i, closing):
+                return i + 1
+            if kind == "include":
+                # The included file's settings can't be seen from here.
+                fail(i, "@include isn't supported")
+            if kind == "env":
+                fail(i, "a setting name from an environment variable isn't supported")
+            name = text[start:end]
+            if kind != "name" or name.lower() in ("true", "false"):
+                fail(i)
+            if name in group.settings:
+                fail(i, "duplicate setting name")
+            setting = group.settings[name] = _Setting(start)
+            i = skip_comments(i + 1)
+            if not is_punct(i, "=:"):
+                fail(i)
+            i = parse_value(skip_comments(i + 1), setting)
+            setting.end = tokens[i - 1][2]
+            terminator = skip_comments(i)
+            if is_punct(terminator, ";,"):
+                i = terminator + 1
+                setting.end = tokens[terminator][2]
+
+    def parse_value(i, setting=None):
+        kind, start, end = tokens[i]
+        if kind == "string":
+            pieces = [(start, end)]
+            while tokens[skip_comments(i + 1)][0] == "string":  # "a" "b" is "ab"
+                i = skip_comments(i + 1)
+                pieces.append(tokens[i][1:])
+            if setting is not None:
+                setting.strings = pieces
+            return i + 1
+        if kind in ("number", "env") or kind == "name" and text[start:end].lower() in ("true", "false"):
+            return i + 1
+        if is_punct(i, "{"):
+            group = _Group(start)
+            if setting is not None:
+                setting.group = group
+            return parse_settings(i + 1, group, "}")
+        if is_punct(i, "[("):
+            closing = "]" if text[start] == "[" else ")"
+            i = skip_comments(i + 1)
+            while not is_punct(i, closing):
+                i = skip_comments(parse_value(i))
+                if is_punct(i, ","):
+                    i = skip_comments(i + 1)
+                elif not is_punct(i, closing):
+                    fail(i)
+            return i + 1
+        fail(i)
+
+    root = _Group(0)
+    root.end = len(text) if left_open is None else left_open[1]
+    try:
+        parse_settings(0, root, None)
+    except RecursionError:
+        raise _ParseError(0, "groups nested too deeply") from None
+    return root
+
+
+def _read_text(path):
+    # libconfig takes any bytes, so bytes that aren't UTF-8 are carried
+    # through unchanged instead of being an error.
+    return path.read_bytes().decode("utf-8", "surrogateescape")
+
+
+def _seed_config_file():
+    """The file a new CONFIG_FILE is copied from."""
+    return DEFAULTS_CONFIG_FILE if DEFAULTS_CONFIG_FILE.exists() else SYSTEM_CONFIG_FILE
+
 
 def _ensure_user_config():
-    # The packaged user service seeds the per-user file from /etc on first
-    # start; do the same here so it can be edited before that.
-    if not CONFIG_FILE.exists() and SYSTEM_CONFIG_FILE.exists():
+    # The packaged user service seeds the per-user file from the desktop
+    # defaults on first start; do the same here so it can be edited before that.
+    seed = _seed_config_file()
+    if not CONFIG_FILE.exists() and seed.exists():
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(SYSTEM_CONFIG_FILE, CONFIG_FILE)
+        shutil.copyfile(seed, CONFIG_FILE)
 
 
-def _config_lines():
-    for path in (CONFIG_FILE, SYSTEM_CONFIG_FILE):
+def _lookup(path):
+    """(text, _Setting) of a setting such as "pipewire.sink_target" in the
+    user's config or, if that can't be read (before it exists), in the file it
+    will be copied from. None if it isn't set, or if there is no file or it
+    doesn't parse (shairport-sync won't start then, so nothing is in use)."""
+    for config_file in (CONFIG_FILE, _seed_config_file()):
         try:
-            return path.read_text().splitlines(keepends=True)
+            text = _read_text(config_file)
         except OSError:
             continue
-    return []
-
-
-def _section_bounds(lines, name):
-    """Line range (start, end) of `name = { ... };`, or None if absent."""
-    start = next((i for i, line in enumerate(lines)
-                  if re.match(rf'^{name}\s*=', line.strip())), None)
-    if start is None:
-        return None
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("};")),
-               len(lines))
-    return start, end
-
-
-def _match_pipewire_setting(value_re):
-    """The first match of value_re in the pipewire section, or None."""
-    lines = _config_lines()
-    bounds = _section_bounds(lines, "pipewire")
-    if bounds:
-        for line in lines[bounds[0]:bounds[1]]:
-            match = value_re.match(line)
-            if match:
-                return match
+        try:
+            setting = _find(_parse_config(text), path)
+        except _ParseError:
+            return None
+        return None if setting is None else (text, setting)
     return None
 
 
-def _write_pipewire_line(line_re, new_line):
-    """Replace the pipewire-section line matching line_re (set or commented out)
-    with new_line, or add new_line at the top of the section."""
-    _ensure_user_config()
-    lines = CONFIG_FILE.read_text().splitlines(keepends=True)
-    bounds = _section_bounds(lines, "pipewire")
-    if bounds is None:
-        lines += ["\npipewire =\n", "{\n", new_line, "};\n"]
-    else:
-        start, end = bounds
-        existing = next((i for i in range(start, end) if line_re.match(lines[i])), None)
-        if existing is not None:
-            lines[existing] = new_line
-        else:
-            brace = next((i for i in range(start, end) if "{" in lines[i]), start)
-            lines.insert(brace + 1, new_line)
+def _find(group, path):
+    """The _Setting at a path such as "pipewire.sink_target" in group, or None."""
+    *parents, name = path.split(".")
+    for parent in parents:
+        setting = group.settings.get(parent)
+        if setting is None or setting.group is None:
+            return None
+        group = setting.group
+    return group.settings.get(name)
 
-    tmp = CONFIG_FILE.with_suffix(".conf.tmp")
-    tmp.write_text("".join(lines))
-    os.replace(tmp, CONFIG_FILE)
+
+def _expand_env_ref(match):
+    if match.group(1) is None:
+        return "${"
+    return os.environ.get(match.group(1), match.group(0))
+
+
+def _unescape(match):
+    if match.group(1) is not None:
+        return _ESCAPES[match.group(1)]
+    return bytes([int(match.group(2), 16)])
+
+
+def _string_value(found):
+    """The value of a setting from _lookup as shairport-sync reads it, or ""
+    if it isn't set or isn't a string (shairport-sync ignores it then)."""
+    if found is None or found[1].strings is None:
+        return ""
+    text, setting = found
+    value = b""
+    for start, end in setting.strings:
+        # ${NAME} is expanded (here from the app's own environment, the nearest
+        # to the service's there is) before libconfig undoes its escapes.
+        piece = _ENV_REF_RE.sub(_expand_env_ref, text[start + 1:end - 1])
+        value += _ESCAPE_RE.sub(_unescape, piece.encode("utf-8", "surrogateescape"))
+    return value.decode("utf-8", "replace")
+
+
+def _comment_after(text, setting):
+    """(end, text) of a comment that follows a setting on its line, or None."""
+    match = _COMMENT_AFTER_RE.match(text, setting.end)
+    if match is None:
+        return None
+    return match.end(), match.group("line") or match.group("block") or ""
+
+
+def _quote(value):
+    """value as a libconfig string that shairport-sync reads back unchanged."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ConfigError(f"{value!r} can't be saved in {CONFIG_FILE}") from None
+    quoted = "".join(_QUOTED.get(c) or (f"\\x{ord(c):02x}" if c < " " else c) for c in value)
+    return '"' + quoted.replace("${", "$${") + '"'
+
+
+def _own_lines(text, start, end):
+    """(begin, end) of the lines holding text[start:end], with the newline, if
+    nothing else is on them; else None."""
+    begin = text.rfind("\n", 0, start) + 1
+    match = _LINE_END_RE.match(text, end)
+    if match is None or text[begin:start].strip(" \t\f"):
+        return None
+    return begin, match.end()
+
+
+def _line_ending(line):
+    return "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+
+
+def _is_commented_out(text, comment, key):
+    """Whether a comment is a line of its own holding a commented-out <key> setting."""
+    start, end = comment
+    return (re.match(rf'(?://|#)[ \t]*{key}[ \t]*[=:]', text[start:end]) is not None
+            and _own_lines(text, start, end) is not None)
+
+
+def _inline(setting, comment):
+    # For a setting that shares its line with others.
+    return f"{setting} /* {comment.replace('*/', '* /')} */"
+
+
+def _edit_group(text, group, key, setting, comment, off_line):
+    """text with the group's <key> setting replaced by `setting` (its
+    `key = value;`), followed by comment, or with setting None, removed."""
+    current = group.settings.get(key)
+    commented = next((c for c in group.comments if _is_commented_out(text, c, key)), None)
+    if current is not None:
+        start, end = current.start, current.end
+        after = _comment_after(text, current)
+        if after is not None:
+            end = after[0]  # the comment after it goes with it
+        lines = _own_lines(text, start, end)
+        if lines is not None:
+            begin, finish = lines
+            newline = _line_ending(text[begin:finish])
+            if setting is not None:
+                new = f"{text[begin:start]}{setting} // {comment}{newline}"
+            elif commented is not None:
+                new = ""  # it's already there commented out
+            else:
+                new = off_line.rstrip("\n") + newline
+            return text[:begin] + new + text[finish:]
+        # It shares its line with other settings, so change only its own text.
+        if setting is not None:
+            return text[:start] + _inline(setting, comment) + text[end:]
+        finish = _BLANKS_RE.match(text, end).end()
+        if text[finish:finish + 1] in ("", "\r", "\n"):
+            finish = end
+            while start > 0 and text[start - 1] in " \t\f":
+                start -= 1
+        return text[:start] + text[finish:]
+    if setting is None:
+        return text
+    if commented is not None:
+        begin, finish = _own_lines(text, *commented)
+        newline = _line_ending(text[begin:finish])
+        return text[:begin] + f"\t{setting} // {comment}{newline}" + text[finish:]
+    # A new setting goes at the top of the group: on a line of its own if the
+    # "{" ends its line, else straight after the "{".
+    brace_end = group.start + 1
+    match = _REST_OF_LINE_RE.match(text, brace_end)
+    if match is not None:
+        newline = _line_ending(match.group())
+        return text[:match.end()] + f"\t{setting} // {comment}{newline}" + text[match.end():]
+    return text[:brace_end] + " " + _inline(setting, comment) + text[brace_end:]
+
+
+def _save_config(path, text):
+    """Atomically replace path with text, keeping its permissions and, where
+    allowed, its owner."""
+    if not os.access(path, os.W_OK):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+    info = path.stat()
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode("utf-8", "surrogateescape"))
+            f.flush()
+            os.fchmod(f.fileno(), stat.S_IMODE(info.st_mode))
+            with contextlib.suppress(OSError):
+                os.fchown(f.fileno(), info.st_uid, info.st_gid)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _edit_is_right(text, key, value):
+    """Whether text parses with pipewire.<key> set to value (with value None, unset)."""
+    try:
+        setting = _find(_parse_config(text), "pipewire." + key)
+    except _ParseError:
+        return False
+    if value is None:
+        return setting is None
+    return setting is not None and _string_value((text, setting)) == value
+
+
+def _write_pipewire_setting(key, value, comment, off_line):
+    """Set pipewire.<key> to the string value, followed by comment. With value
+    None, unset it instead, leaving off_line (the setting commented out) unless
+    it is already commented out somewhere in the group. Raises OSError:
+    ConfigError if the file doesn't parse or can't be changed safely."""
+    _ensure_user_config()
+    path = Path(os.path.realpath(CONFIG_FILE))  # a symlinked config is edited where it lives
+    text = _read_text(path)
+    try:
+        root = _parse_config(text)
+    except _ParseError as err:
+        line = text.count("\n", 0, err.offset) + 1
+        raise ConfigError(f"{CONFIG_FILE}, line {line}: {err}") from None
+    setting = None if value is None else f"{key} = {_quote(value)};"
+    pipewire = root.settings.get("pipewire")
+    if pipewire is None:
+        if setting is None:
+            return
+        # The group goes at the end of the file, before a string or comment
+        # left open there, which would swallow it.
+        first = text.find("\n")
+        newline = "\r\n" if first > 0 and text[first - 1] == "\r" else "\n"
+        group = newline.join(["", "pipewire =", "{", f"\t{setting} // {comment}", "};", ""])
+        new_text = text[:root.end] + group + text[root.end:]
+    elif pipewire.group is None:
+        line = text.count("\n", 0, pipewire.start) + 1
+        raise ConfigError(f"{CONFIG_FILE}, line {line}: pipewire isn't a group")
+    else:
+        new_text = _edit_group(text, pipewire.group, key, setting, comment, off_line)
+    if new_text == text:
+        return
+    if not _edit_is_right(new_text, key, value):  # a last check, in case the edit misread the layout
+        raise ConfigError(f"{CONFIG_FILE}: pipewire.{key} can't be changed safely in this file")
+    _save_config(path, new_text)
 
 
 def _read_sink_target():
     """(node.name, label) from pipewire.sink_target; ("", "") means follow the default."""
-    match = _match_pipewire_setting(SINK_TARGET_VALUE_RE)
-    if match is None:
+    found = _lookup("pipewire.sink_target")
+    name = _string_value(found)
+    if not name:
         return "", ""
-    comment = match.group(2)
-    label = comment.split(LABEL_MARKER, 1)[1].strip() if LABEL_MARKER in comment else ""
-    return match.group(1).replace('\\"', '"').replace("\\\\", "\\"), label
+    comment = _comment_after(*found)
+    label = comment[1].split(LABEL_MARKER, 1)[1] if comment and LABEL_MARKER in comment[1] else ""
+    return name, label.encode("utf-8", "surrogateescape").decode("utf-8", "replace").strip()
 
 
 def _write_sink_target(name, label):
     if name:
-        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
-        label = " ".join(label.split())
-        new_line = f'\tsink_target = "{escaped}"; // {LABEL_MARKER}{label}\n'
+        # The label goes in a comment, so keep it to one line of printable text.
+        label = " ".join(_CONTROL_CHARS_RE.sub(" ", label).split())
+        _write_pipewire_setting("sink_target", name, LABEL_MARKER + label, SINK_TARGET_DEFAULT_LINE)
     else:
-        new_line = SINK_TARGET_DEFAULT_LINE
-    _write_pipewire_line(SINK_TARGET_LINE_RE, new_line)
+        _write_pipewire_setting("sink_target", None, None, SINK_TARGET_DEFAULT_LINE)
 
 
 def _read_device_volume():
-    match = _match_pipewire_setting(MIXER_TYPE_VALUE_RE)
-    return match is not None and match.group(1).strip().lower() == "sink"
+    # Compared as shairport-sync does: ignoring case, but not blanks.
+    mixer_type = _string_value(_lookup("pipewire.mixer_type"))
+    return mixer_type.isascii() and mixer_type.lower() == "sink"
 
 
 def _write_device_volume(enabled):
-    _write_pipewire_line(MIXER_TYPE_LINE_RE, MIXER_TYPE_ON_LINE if enabled else MIXER_TYPE_OFF_LINE)
+    _write_pipewire_setting("mixer_type", "sink" if enabled else None, MIXER_TYPE_ON_COMMENT,
+                            MIXER_TYPE_OFF_LINE)
 
 
 def _uses_pipewire_backend():
-    lines = _config_lines()
-    bounds = _section_bounds(lines, "general")
-    if bounds:
-        for line in lines[bounds[0]:bounds[1]]:
-            match = OUTPUT_BACKEND_RE.match(line)
-            if match:
-                return match.group(1) == "pipewire"
+    # shairport-sync matches the name ignoring case. With none set it uses its
+    # first backend, which in the packaged builds is ALSA.
+    backend = _string_value(_lookup("general.output_backend"))
+    return backend.isascii() and backend.lower() == "pipewire"
+
+
+def _config_parses():
+    """Whether the config shairport-sync reads when it starts parses; it won't
+    start with one that doesn't."""
+    for config_file in (CONFIG_FILE, _seed_config_file()):
+        try:
+            text = _read_text(config_file)
+        except OSError:
+            continue
+        try:
+            _parse_config(text)
+        except _ParseError:
+            return False
+        return True
     return False
 
 
@@ -183,28 +563,57 @@ class Receiver(QObject):
     outputsChanged = pyqtSignal()
     deviceVolumeChanged = pyqtSignal()
     errorOccurred = pyqtSignal(str)
+    noticeOccurred = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._bus = QDBusConnection.sessionBus()
         self._state = self._empty_state()
-        self._unit_state = "unknown"
         self._position = 0.0
+
+        # The receiver's unit. unitState is its ActiveState, or "failing" while
+        # systemd keeps restarting it after it stopped by itself.
+        self._unit_state = "unknown"
+        self._active_state = "unknown"
+        self._failed_unit = RECEIVER_UNIT
+        self._unit_seen = False
+        self._process = None        # which run of the unit is the running receiver
+        self._main_pid = 0
+        self._started = 0.0         # when that run started, as time.time()
+        self._observed = False      # whether the app saw it start
+        self._n_restarts = None
+        self._crashed = None        # time.monotonic() of the last automatic restart seen
 
         # Output selection and volume mode. The lasting choices are
         # pipewire.sink_target and pipewire.mixer_type in the user's config,
         # which shairport-sync only reads at startup, so a change is applied by
-        # restarting it once nothing is playing. A stream that is already
+        # restarting it once no sender is connected. A stream that is already
         # playing is moved to a new output straight away through PipeWire
-        # metadata.
+        # metadata, unless the receiver sets its output device's volume: it
+        # sets that of the device it started with until it restarts, so the
+        # stream stays there until then.
         self._pipewire_ok = False
+        self._pw_started = 0.0
+        self._pw_time = 0.0         # when the last pw-dump was taken
+        self._pw_history = []       # (time, sink names, default sink) of the last two
         self._sinks = []
         self._default_sink = ""
         self._stream_id = None
+        self._pinned_stream = None
+        self._sink_volume_client = False
         self._output_target, self._output_label = _read_sink_target()
         self._device_volume = _read_device_volume()
-        self._running_settings = self._settings()  # what the receiver process started with
+        self._choice = None         # (node.name, label) picked but not saved yet
+        self._running = None        # what the running receiver started with
         self._restart_pending = False
+        self._restart_sent = None   # the run a restart was last asked for
+        self._device_volume_warning = ""
+
+        self._commit_timer = QTimer(self, singleShot=True, interval=OUTPUT_COMMIT_MS)
+        self._commit_timer.timeout.connect(self.commitOutput)
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._quit)
 
         self._pw_dump = QProcess(self)
         self._pw_dump.finished.connect(self._on_pw_dump_finished)
@@ -237,7 +646,7 @@ class Receiver(QObject):
         self._watcher.serviceRegistered.connect(lambda _name: self._refresh_timer.start())
         self._watcher.serviceUnregistered.connect(lambda _name: self.refresh())
 
-        self._poll_unit()
+        self._read_unit()
         self.refresh()
 
     @staticmethod
@@ -246,6 +655,7 @@ class Receiver(QObject):
             "online": False,
             "receiverName": "",
             "version": "",
+            "protocol": "",
             "active": False,
             "clientName": "",
             "clientAddress": "",
@@ -270,6 +680,7 @@ class Receiver(QObject):
     online = _state_property("online", bool)
     receiverName = _state_property("receiverName")
     version = _state_property("version")
+    protocol = _state_property("protocol")  # "AirPlay 2", or "AirPlay" for classic AirPlay
     active = _state_property("active", bool)
     clientName = _state_property("clientName")
     clientAddress = _state_property("clientAddress")
@@ -288,6 +699,15 @@ class Receiver(QObject):
     @pyqtProperty(str, notify=stateChanged)
     def unitState(self):
         return self._unit_state
+
+    @pyqtProperty(str, notify=stateChanged)
+    def failedUnit(self):
+        """The unit whose log tells why the receiver isn't working, without ".service"."""
+        return self._failed_unit.removesuffix(".service")
+
+    @pyqtProperty(bool, notify=stateChanged)
+    def inSession(self):
+        return self._in_session()
 
     @pyqtProperty(float, notify=positionChanged)
     def position(self):
@@ -309,13 +729,14 @@ class Receiver(QObject):
     def defaultOutput(self):
         return next((s["description"] for s in self._sinks if s["name"] == self._default_sink), "")
 
+    # The output picked: one waiting to be saved, or else the saved one.
     @pyqtProperty(str, notify=outputsChanged)
     def outputTarget(self):
-        return self._output_target
+        return self._choice[0] if self._choice else self._output_target
 
     @pyqtProperty(str, notify=outputsChanged)
     def outputTargetLabel(self):
-        return self._output_label
+        return self._choice[1] if self._choice else self._output_label
 
     @pyqtProperty(bool, notify=deviceVolumeChanged)
     def deviceVolumeAvailable(self):
@@ -324,6 +745,12 @@ class Receiver(QObject):
     @pyqtProperty(bool, notify=deviceVolumeChanged)
     def deviceVolume(self):
         return self._device_volume
+
+    # Why Use Device Volume is on but the running receiver turns the audio down
+    # itself, or "".
+    @pyqtProperty(str, notify=deviceVolumeChanged)
+    def deviceVolumeWarning(self):
+        return self._device_volume_warning
 
     # ---- D-Bus helpers -------------------------------------------------
 
@@ -362,6 +789,7 @@ class Receiver(QObject):
             "online": True,
             "receiverName": core.get("ServiceName", ""),
             "version": core.get("Version", ""),
+            "protocol": core.get("Protocol", ""),
             "active": bool(core.get("Active", False)),
             "clientName": remote.get("ClientName", ""),
             "clientAddress": remote.get("Client", ""),
@@ -390,6 +818,16 @@ class Receiver(QObject):
             self.positionChanged.emit()
         self._apply_pending_restart()
 
+    def _in_session(self):
+        # A sender is connected: playing, or paused (an AirPlay 2 sender that
+        # pauses goes inactive but stays connected), until it disconnects and
+        # MPRIS goes back to Stopped. The window shows this as streaming too.
+        s = self._state
+        return s["online"] and (s["active"] or s["playbackStatus"] != "Stopped")
+
+    def _session_over(self):
+        return self._state["online"] and not self._in_session()
+
     def _poll_position(self):
         if not self._state["online"]:
             return
@@ -403,38 +841,195 @@ class Receiver(QObject):
             self._position = seconds
             self.positionChanged.emit()
 
-    def _poll_unit(self):
+    # ---- the receiver's unit -------------------------------------------
+
+    def _unit_properties(self, unit, *interfaces):
+        path = self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER, "LoadUnit", unit)[0]
+        path = path.path() if hasattr(path, "path") else str(path)
+        props = {}
+        for interface in interfaces:
+            props.update(self._get_all(SYSTEMD_SERVICE, path, interface) or {})
+        return props
+
+    def _read_unit(self):
+        """Update what is known about the receiver's unit; True if unitState
+        or failedUnit changed."""
         try:
-            unit_path = self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER,
-                                   "LoadUnit", RECEIVER_UNIT)[0]
-            unit_path = unit_path.path() if hasattr(unit_path, "path") else str(unit_path)
-            state = self._call(SYSTEMD_SERVICE, unit_path, PROPS_IFACE, "Get",
-                               SYSTEMD_UNIT, "ActiveState")[0]
+            unit = self._unit_properties(RECEIVER_UNIT, SYSTEMD_UNIT, SYSTEMD_SERVICE_IFACE)
         except (RuntimeError, IndexError):
-            state = "unknown"
-        if state != self._unit_state:
-            self._unit_state = state
+            unit = {}
+        state = unit.get("ActiveState", "unknown")
+        invocation = unit.get("InvocationID") or b""  # new with every start
+        invocation = invocation.data() if hasattr(invocation, "data") else bytes(invocation)
+        main_pid = unit.get("MainPID") or 0
+        started = (unit.get("ExecMainStartTimestamp") or unit.get("ActiveEnterTimestamp") or 0) / 1e6
+        process = invocation.hex() or (f"{main_pid}@{started}" if main_pid else "")
+
+        now = time.monotonic()
+        restarts = unit.get("NRestarts")
+        restarts = restarts if isinstance(restarts, int) else None
+        if (state == "activating" and unit.get("SubState") == "auto-restart"
+                or None not in (restarts, self._n_restarts) and restarts > self._n_restarts):
+            self._crashed = now
+        self._n_restarts = restarts
+
+        if state == "active" and process != self._process:
+            # A receiver process the app hasn't seen yet. It was seen starting
+            # if the app was already watching the unit, or it has only just
+            # started.
+            self._observed = self._unit_seen or time.time() - (started or time.time()) < SETTLE_S
+            self._process, self._main_pid = process, main_pid
+            self._started = started or time.time()
+            self._pinned_stream = None
+            self._running = None
+        if state == "active" and self._running is None:
+            self._adopt_receiver()  # again while the config doesn't parse
+        self._unit_seen = self._unit_seen or state != "unknown"
+
+        shown, failed_unit = state, RECEIVER_UNIT
+        if state == "failed":
+            pass
+        elif (state not in ("inactive", "unknown") and self._crashed is not None
+              and now - self._crashed < FAILING_S
+              and not (state == "active" and time.time() - self._started >= FAILING_S)):
+            shown = "failing"
+        elif state != "active":
+            # The receiver can't start while the timing service it needs fails.
+            try:
+                timing = self._unit_properties(TIMING_UNIT, SYSTEMD_UNIT)
+            except (RuntimeError, IndexError):
+                timing = {}
+            if timing.get("ActiveState") == "failed":
+                shown, failed_unit = "failed", TIMING_UNIT
+            elif timing.get("ActiveState") == "activating" and timing.get("SubState") == "auto-restart":
+                shown, failed_unit = "failing", TIMING_UNIT
+
+        self._active_state = state
+        if (shown, failed_unit) == (self._unit_state, self._failed_unit):
+            return False
+        self._unit_state, self._failed_unit = shown, failed_unit
+        return True
+
+    def _poll_unit(self):
+        if self._read_unit():
             self.stateChanged.emit()
+        if self._active_state == "active" and not self._state["online"]:
+            # Its objects may not have been exported yet when its names
+            # appeared on the bus.
+            self.refresh()
+        self._update_device_volume_warning()
+        self._apply_pending_restart()
+
+    def _adopt_receiver(self):
+        # What a receiver process started with: what an earlier run of the app
+        # saved for that very process, or else the config as it is now, which
+        # the receiver read when it started (unless it was changed since while
+        # the app wasn't open: that can't be told apart from an unrelated edit).
+        self._running = self._load_record()
+        if self._running is not None:
+            return
+        self._reload_settings()
+        if not _config_parses():
+            return  # it didn't start with this; wait for the file to be fixed
+        self._running = {
+            "process": self._process,
+            "target": self._output_target,
+            "device_volume": self._device_volume,
+            "default_sink": None,       # the default output when it started
+            "target_present": None,     # whether its device-volume target was there then
+        }
+        self._learn_start_conditions()
+        self._save_record()
+
+    def _learn_start_conditions(self):
+        """Fill in the start conditions of a newly seen receiver process from
+        the first look at PipeWire after it started; True if they changed."""
+        running = self._running
+        if (running is None or not self._pipewire_ok or running["default_sink"] is not None
+                or self._observed and self._pw_time < self._started):
+            return False
+        # If the app didn't see it start, the default output it started with
+        # is taken to be the one now.
+        running["default_sink"] = self._default_sink
+        if self._observed:
+            # There in the first look after it started, and in the last one
+            # before: a device that appeared around then may have come too
+            # late for the receiver.
+            def present(look):
+                _time, names, default_sink = look
+                return (running["target"] or default_sink) in names
+            before = [look for look in self._pw_history if look[0] < self._started][-1:]
+            running["target_present"] = all(present(look) for look in self._pw_history[-1:] + before)
+        return True
+
+    def _load_record(self):
+        try:
+            record = json.loads(STATE_FILE.read_text())
+        except (OSError, ValueError):
+            return None
+        if (not isinstance(record, dict) or not self._process or record.get("process") != self._process
+                or not isinstance(record.get("target"), str)
+                or not isinstance(record.get("device_volume"), bool)):
+            return None
+        default_sink, target_present = record.get("default_sink"), record.get("target_present")
+        return {
+            "process": self._process,
+            "target": record["target"],
+            "device_volume": record["device_volume"],
+            "default_sink": default_sink if isinstance(default_sink, str) else None,
+            "target_present": target_present if isinstance(target_present, bool) else None,
+        }
+
+    def _save_record(self):
+        if self._running is None or not self._process:
+            return
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=STATE_FILE.parent, prefix=f".{STATE_FILE.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self._running, f)
+                os.replace(tmp, STATE_FILE)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+        except OSError:
+            pass  # it only lets a reopened app finish what this one started
 
     # ---- audio outputs -------------------------------------------------
 
     @pyqtSlot()
     def refreshOutputs(self):
+        if self._reload_settings():
+            self._output_changed()
         if self._pw_dump.state() == QProcess.ProcessState.NotRunning:
+            self._pw_started = time.time()
             self._pw_dump.start("pw-dump", [])
+        self._apply_pending_restart()
 
     def _on_pw_dump_error(self, _error):
         if self._pipewire_ok:
             self._pipewire_ok = False
             self.outputsChanged.emit()
 
+    def _is_receiver(self, props):
+        """Whether a PipeWire client belongs to the running receiver."""
+        return (props.get("application.process.binary") == "shairport-sync"
+                and (not self._main_pid
+                     or props.get("application.process.id") in (self._main_pid, str(self._main_pid))))
+
     def _on_pw_dump_finished(self, _code, _status):
         try:
             objects = json.loads(bytes(self._pw_dump.readAllStandardOutput()) or b"[]")
         except ValueError:
             return
+        if not objects:  # PipeWire isn't running (it always lists itself)
+            self._on_pw_dump_error(None)
+            return
 
-        sps_clients = set()
+        stream_clients = set()
+        sink_volume_client = False
         nodes = []
         default_sink = ""
         stream_targets = {}
@@ -442,8 +1037,16 @@ class Receiver(QObject):
             kind = obj.get("type", "")
             props = (obj.get("info") or {}).get("props") or {}
             if kind == "PipeWire:Interface:Client":
-                if props.get("application.process.binary") == "shairport-sync":
-                    sps_clients.add(obj.get("id"))
+                if not self._is_receiver(props):
+                    continue
+                if props.get("application.name") == SINK_VOLUME_CLIENT:
+                    sink_volume_client = True
+                elif "client.api" not in props:
+                    # The pipewire backend's stream. With the pa or alsa
+                    # backend the receiver plays through pipewire-pulse or
+                    # pipewire-alsa, whose clients have a client.api; their
+                    # output is the system mixer's to choose, not the app's.
+                    stream_clients.add(obj.get("id"))
             elif kind == "PipeWire:Interface:Node":
                 nodes.append((obj.get("id"), props))
             elif kind == "PipeWire:Interface:Metadata":
@@ -463,22 +1066,91 @@ class Receiver(QObject):
             key=lambda s: s["description"].casefold())
         stream_id = next((node_id for node_id, p in nodes
                           if p.get("media.class") == "Stream/Output/Audio"
-                          and p.get("client.id") in sps_clients), None)
+                          and p.get("client.id") in stream_clients), None)
 
-        if stream_id is not None and stream_id != self._stream_id:
-            # A new receiver stream. If its process still has an older choice
-            # (restart pending), or WirePlumber restored a target from someone
-            # moving it elsewhere while we follow the default, put it right.
-            restored = stream_targets.get(stream_id)
-            if self._restart_pending or (not self._output_target and restored not in (None, -1, "-1")):
-                self._move_stream(stream_id, self._output_target)
+        new_stream = stream_id is not None and stream_id != self._stream_id
+        if stream_id != self._stream_id:
+            self._pinned_stream = None  # PipeWire reuses the ids of objects that have gone
         self._stream_id = stream_id
-
-        if (not self._pipewire_ok or sinks != self._sinks or default_sink != self._default_sink):
-            self._pipewire_ok = True
-            self._sinks = sinks
-            self._default_sink = default_sink
+        self._sink_volume_client = sink_volume_client
+        self._pw_time = self._pw_started
+        changed = (not self._pipewire_ok or sinks != self._sinks or default_sink != self._default_sink)
+        self._pipewire_ok = True
+        self._sinks = sinks
+        self._default_sink = default_sink
+        self._pw_history = self._pw_history[-1:] + [
+            (self._pw_time, {s["name"] for s in sinks}, default_sink)]
+        if self._learn_start_conditions():
+            self._save_record()
+        if changed:
             self.outputsChanged.emit()
+
+        if new_stream:
+            self._place_new_stream(stream_targets.get(stream_id))
+        self._keep_on_volume_device()
+        self._update_device_volume_warning()
+        self._apply_pending_restart()
+
+    def _sink_present(self, name):
+        return bool(name) and any(s["name"] == name for s in self._sinks)
+
+    def _output_name(self, name):
+        if not name:
+            return "the default output"
+        if name == self._output_target and self._output_label:
+            return self._output_label
+        return next((s["description"] for s in self._sinks if s["name"] == name), name)
+
+    def _place_new_stream(self, restored):
+        # A new receiver stream: a session started, or the receiver
+        # reconnected its stream.
+        if not _uses_pipewire_backend():
+            return
+        running = self._running
+        moved_away = restored not in (None, -1, "-1")
+        if self._sets_device_volume():
+            # It plays where the volume it sets is: on the target it started
+            # with, or with Follow System on the default it started with (which
+            # _keep_on_volume_device sees to if the default has changed since).
+            if not running["target"] and moved_away and self._volume_device_to_keep() is None:
+                # WirePlumber restored a target from someone moving it
+                # elsewhere; put it right.
+                self._move_stream(self._stream_id, "")
+        elif running is not None and running["target"] != self._output_target:
+            # Its process still has an older choice; it restarts to take the
+            # new one once the session is over.
+            self._move_stream(self._stream_id, self._output_target)
+        elif not self._output_target and moved_away:
+            # WirePlumber restored a target from someone moving it elsewhere
+            # while we follow the default; put it right.
+            self._move_stream(self._stream_id, "")
+
+    def _volume_device_to_keep(self):
+        """The output to keep the receiver's stream on, by name, because the
+        receiver sets its volume, or None. With Follow System, a receiver that
+        sets its device's volume sets that of the default output it started
+        with, so when the default changes its stream is kept on that device
+        until the receiver can restart."""
+        running = self._running
+        if (self._device_volume_state() != "on" or running["target"]
+                or not running["default_sink"] or running["default_sink"] == self._default_sink
+                or not self._sink_present(running["default_sink"])):
+            return None
+        return running["default_sink"]
+
+    def _keep_on_volume_device(self):
+        # Once per stream, see _volume_device_to_keep.
+        if self._stream_id is None or self._stream_id == self._pinned_stream:
+            return
+        device = self._volume_device_to_keep()
+        if device is None:
+            return
+        self._pinned_stream = self._stream_id
+        self._move_stream(self._stream_id, device)
+        if self._in_session():
+            self.noticeOccurred.emit(
+                f"AirPlay keeps playing on {self._output_name(device)} until this "
+                "session ends, because the sender's volume control sets the volume of that device.")
 
     @staticmethod
     def _move_stream(stream_id, target):
@@ -492,24 +1164,68 @@ class Receiver(QObject):
 
     @pyqtSlot(str)
     def setOutput(self, name):
-        if name == self._output_target:
+        """Pick an output. It is saved and applied once the choice has stayed
+        put for OUTPUT_COMMIT_MS, or at commitOutput()."""
+        if name == (self._choice[0] if self._choice else self._output_target):
             return
         label = next((s["description"] for s in self._sinks if s["name"] == name), "")
-        try:
-            _write_sink_target(name, label)
-        except OSError as err:
-            self.errorOccurred.emit(f"Could not save the output choice: {err}")
-            return
-        self._output_target, self._output_label = name, label if name else ""
+        if not label and name == self._output_target:
+            label = self._output_label
+        self._choice = (name, label if name else "")
         self.outputsChanged.emit()
+        self._commit_timer.start()
 
-        if self._stream_id is not None:
-            self._move_stream(self._stream_id, name)
-        self._settings_changed()
+    @pyqtSlot()
+    def commitOutput(self):
+        if self._save_choice():
+            self._apply_pending_restart()
+
+    def _quit(self):
+        self._save_choice()
+        self._apply_pending_restart(quitting=True)
+
+    def _save_choice(self):
+        """Save a picked output; True if the saved output changed (here, or in
+        the file since it was last read)."""
+        self._commit_timer.stop()
+        choice, self._choice = self._choice, None
+        if choice is None:
+            return False
+        changed = self._reload_settings()
+        name, label = choice
+        if name != self._output_target:
+            try:
+                _write_sink_target(name, label)
+            except OSError as err:
+                self.errorOccurred.emit(f"Could not save the output choice: {err}")
+            else:
+                self._output_target, self._output_label = name, label
+                changed = True
+        self.outputsChanged.emit()  # on failure, the picker goes back to the saved output
+        if changed:
+            self._output_changed()
+        return changed
+
+    def _output_changed(self):
+        # The saved output changed: move a playing stream to it.
+        if self._stream_id is None or not _uses_pipewire_backend():
+            return
+        if self._sets_device_volume():
+            if self._in_session():
+                volume_device = self._running["target"] or self._running["default_sink"]
+                self.noticeOccurred.emit(
+                    f"AirPlay switches to {self._output_name(self._output_target)} when this session "
+                    f"ends. Until then it stays on {self._output_name(volume_device)}, because the "
+                    "sender's volume control sets the volume of that device.")
+            return
+        self._move_stream(self._stream_id, self._output_target)
 
     @pyqtSlot(bool)
     def setDeviceVolume(self, enabled):
+        if self._reload_settings():
+            self._output_changed()
         if enabled == self._device_volume:
+            self.deviceVolumeChanged.emit()
             return
         try:
             _write_device_volume(enabled)
@@ -518,27 +1234,111 @@ class Receiver(QObject):
             self.deviceVolumeChanged.emit()  # puts the menu's check mark back
             return
         self._device_volume = enabled
+        self._update_device_volume_warning()
         self.deviceVolumeChanged.emit()
-        self._settings_changed()
+        self._apply_pending_restart()
 
     # ---- applying settings -----------------------------------------------
 
     def _settings(self):
         return (self._output_target, self._device_volume)
 
-    def _settings_changed(self):
-        if self._unit_state == "active":
-            self._restart_pending = self._settings() != self._running_settings
-            self._apply_pending_restart()
-        else:
-            self._running_settings = self._settings()  # picked up whenever it next starts
+    def _reload_settings(self):
+        """Pick up changes to the output and volume settings made outside the
+        app, e.g. with Edit Settings…; True if the saved output changed."""
+        if not _config_parses():
+            return False  # e.g. saved halfway through an edit
+        target = _read_sink_target()
+        device_volume = _read_device_volume()
+        changed = target[0] != self._output_target
+        if target != (self._output_target, self._output_label):
+            self._output_target, self._output_label = target
+            self.outputsChanged.emit()
+        if device_volume != self._device_volume:
+            self._device_volume = device_volume
+            self.deviceVolumeChanged.emit()
+        return changed
 
-    def _apply_pending_restart(self):
-        # Restarting drops a connected sender, so wait until the session is over.
-        if (self._restart_pending and not self._state["active"]
-                and self._state["playbackStatus"] != "Playing"):
-            self._restart_pending = False
-            self._manage_units("RestartUnit", (RECEIVER_UNIT,))
+    def _device_volume_state(self):
+        """"on" if the running receiver sets its output device's volume,
+        "fallback" if it started with Use Device Volume but turns the audio
+        down itself (it gives up if it can't find the device as it starts), or
+        "" if it didn't start with it or this isn't known yet. Use Device
+        Volume is a setting of the pipewire backend; it does nothing with the
+        others."""
+        running = self._running
+        if (running is None or not running["device_volume"] or self._active_state != "active"
+                or not self._pipewire_ok or self._pw_time < self._started + SETTLE_S
+                or not _uses_pipewire_backend()):
+            return ""
+        return "on" if self._sink_volume_client else "fallback"
+
+    def _sets_device_volume(self):
+        # As far as is known: a stream mustn't leave the device whose volume
+        # the sender's volume control sets.
+        running = self._running
+        return running is not None and running["device_volume"] and self._device_volume_state() != "fallback"
+
+    def _restart_reason(self):
+        """Why the running receiver should be restarted, or None."""
+        running = self._running
+        if (self._active_state != "active" or running is None or running["process"] != self._process):
+            return None
+        reason = None
+        device_volume_state = self._device_volume_state()
+        if (running["target"], running["device_volume"]) != self._settings():
+            reason = "the settings changed"
+        elif (device_volume_state == "fallback" and running["target_present"] is not True
+              and self._sink_present(running["target"] or self._default_sink)):
+            reason = "the device for Use Device Volume is there now"
+        elif (device_volume_state == "on" and not running["target"] and running["default_sink"] is not None
+              and self._default_sink and running["default_sink"] != self._default_sink):
+            reason = "the default output changed"
+        if reason is None or not _uses_pipewire_backend() or not _config_parses():
+            return None
+        return reason
+
+    def _apply_pending_restart(self, quitting=False):
+        # Restarting drops a connected sender, so wait until the session is
+        # over. While the receiver's D-Bus objects can't be reached, whether a
+        # sender is connected isn't known, so a change waits for its next
+        # start. A run that has only just started is left to run for
+        # MIN_RUN_S first, so that a quick run of changes restarts it fewer
+        # times, unless the app is quitting and won't be there to restart it
+        # later. Only the run the settings were compared with is restarted, and
+        # only while it runs: a receiver stopped meanwhile stays stopped.
+        self._restart_pending = (self._restart_reason() is not None
+                                 and self._restart_sent != self._process)
+        if (not self._restart_pending or not self._session_over()
+                or not quitting and time.time() - self._started < MIN_RUN_S):
+            return
+        if self._read_unit():  # make sure that run is still the one going
+            self.stateChanged.emit()
+        self._restart_pending = False
+        if self._restart_reason() is not None and self._restart_sent != self._process:
+            self._manage_units("TryRestartUnit", (RECEIVER_UNIT,))
+
+    def _update_device_volume_warning(self):
+        warning = ""
+        running = self._running
+        if self._device_volume and self._device_volume_state() == "fallback":
+            device = running["target"] or self._default_sink
+            name = self._output_name(device) if device else "the output device"
+            if running["target_present"] is True:
+                warning = (f"Use Device Volume isn't in effect: the receiver couldn't set the volume of "
+                           f"{name}, so the sender's volume control turns the audio down digitally. "
+                           "Check its log with “journalctl --user -u shairport-sync”.")
+            elif not self._sink_present(device):
+                warning = (f"Use Device Volume isn't in effect: {name} isn't connected, so the sender's "
+                           "volume control turns the audio down digitally. This app restarts the "
+                           "receiver to use the device's volume once it is connected and nothing is playing.")
+            else:
+                warning = (f"Use Device Volume isn't in effect yet: {name} wasn't connected when the "
+                           "receiver started. This app restarts the receiver to use the device's volume "
+                           "once nothing is playing.")
+        if warning != self._device_volume_warning:
+            self._device_volume_warning = warning
+            self.deviceVolumeChanged.emit()
 
     # ---- actions -------------------------------------------------------
 
@@ -572,18 +1372,30 @@ class Receiver(QObject):
             self.errorOccurred.emit(f"Could not disconnect: {err}")
 
     def _manage_units(self, method, units):
-        if method in ("StartUnit", "RestartUnit"):
-            self._running_settings = self._settings()
+        # Whatever this does, the receiver reads the config when it next
+        # starts, so the run going now has nothing left to apply.
+        self._save_choice()
+        self._restart_sent = self._process
+        # Nor is a crash seen before still news: should the run this starts
+        # crash too, NRestarts or SubState shows it again.
+        self._crashed = self._n_restarts = None
+        if method in ("StartUnit", "RestartUnit") and self._unit_state in ("failed", "failing"):
+            # As `systemctl reset-failed` does, so that a unit that hit its
+            # start limit can start again.
+            for unit in (RECEIVER_UNIT, TIMING_UNIT):
+                with contextlib.suppress(RuntimeError):
+                    self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER, "ResetFailedUnit", unit)
         try:
             for unit in units:
                 self._call(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER, method, unit, "replace")
         except RuntimeError as err:
-            self.errorOccurred.emit(f"Could not {method[:-4].lower()} the receiver: {err}")
+            action = method.removeprefix("Try").removesuffix("Unit").lower()
+            self.errorOccurred.emit(f"Could not {action} the receiver: {err}")
         QTimer.singleShot(300, self._poll_unit)
 
     @pyqtSlot()
     def startReceiver(self):
-        # shairport-sync.service Wants= nqptp.service, so this brings up both.
+        # shairport-sync.service pulls in nqptp.service, so this brings up both.
         self._manage_units("StartUnit", (RECEIVER_UNIT,))
 
     @pyqtSlot()
@@ -596,14 +1408,39 @@ class Receiver(QObject):
 
     @pyqtSlot()
     def openConfig(self):
-        _ensure_user_config()
+        try:
+            _ensure_user_config()
+        except OSError as err:
+            self.errorOccurred.emit(f"Could not create {CONFIG_FILE}: {err}")
+            return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(CONFIG_FILE)))
 
 
-def main():
-    # Use Plasma's own Qt Quick Controls style so the window matches the desktop.
-    os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
+@pyqtClassInfo("D-Bus Interface", APP_SERVICE)
+class _Activator(QObject):
+    """Lets a second launch of the app bring this one's window forward."""
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.window = None
+
+    @pyqtSlot(str)
+    def Activate(self, token):  # noqa: N802 (a D-Bus method)
+        if self.window is None:
+            return
+        if token:
+            # On Wayland a window may only take the focus with the token the
+            # launcher gave the new launch.
+            os.environ["XDG_ACTIVATION_TOKEN"] = token
+        if self.window.visibility() == QWindow.Visibility.Minimized:
+            self.window.showNormal()
+        else:
+            self.window.show()
+        self.window.raise_()
+        self.window.requestActivate()
+
+
+def main():
     app = QApplication(sys.argv)
     app.setApplicationName("shairport-sync-gui")
     app.setOrganizationName("shairport-sync")
@@ -611,12 +1448,35 @@ def main():
     app.setDesktopFileName("shairport-sync")
     app.setWindowIcon(QIcon.fromTheme("shairport-sync", QIcon(str(HERE / "shairport-sync.svg"))))
 
-    receiver = Receiver()
+    # One window: a second launch hands over to the first and exits.
+    bus = QDBusConnection.sessionBus()
+    activator = _Activator(app)
+    bus.registerObject(APP_PATH, activator, QDBusConnection.RegisterOption.ExportAllSlots)
+    if bus.isConnected() and not bus.registerService(APP_SERVICE):
+        msg = QDBusMessage.createMethodCall(APP_SERVICE, APP_PATH, APP_SERVICE, "Activate")
+        msg.setArguments([os.environ.get("XDG_ACTIVATION_TOKEN", "")])
+        bus.call(msg, QDBus.CallMode.Block, DBUS_TIMEOUT_MS)
+        return 0
+
     engine = QQmlApplicationEngine()
+    # Use Plasma's own Qt Quick Controls style, where it is installed, so the
+    # window matches the desktop.
+    if "QT_QUICK_CONTROLS_STYLE" not in os.environ and any(
+            Path(path, "org/kde/desktop/qmldir").is_file() for path in engine.importPathList()):
+        os.environ["QT_QUICK_CONTROLS_STYLE"] = "org.kde.desktop"
+    errors = []
+    engine.warnings.connect(lambda warnings: errors.extend(w.toString() for w in warnings))
+
+    receiver = Receiver()
     engine.setInitialProperties({"receiver": receiver})
     engine.load(QUrl.fromLocalFile(str(HERE / "qml" / "Main.qml")))
     if not engine.rootObjects():
+        # Started from the launcher, nobody sees what went to stderr.
+        QMessageBox.critical(None, "AirPlay Receiver",
+                             "AirPlay Receiver couldn't open its window. A Qt Quick module it needs "
+                             "may not be installed.\n\n" + "\n".join(errors[:10]))
         return 1
+    activator.window = engine.rootObjects()[0]
     return app.exec()
 
 
