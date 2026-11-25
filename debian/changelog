@@ -1,3 +1,21 @@
+shairport-sync-desktop (5.6.3-1) trixie; urgency=medium
+
+  * New upstream release 5.6.3:
+    - The volume that the D-Bus and MPRIS interfaces report, and so the
+      slider in AirPlay Receiver, no longer lags one change behind.
+    - The D-Bus and MPRIS objects are exported before the bus name
+      appears, so a client that asks at once no longer finds no object.
+    - No crash on exit when libsoxr is in use.
+    - The name and device details of a previous sender are no longer kept
+      for the next connection.
+    - The MPRIS Rate property is 1.0.
+    - New optional dbus_nametag setting and --dbus-nametag option, which
+      add a tag to the D-Bus and MPRIS bus names, and a new "metadata"
+      mDNS backend. Neither is used by default.
+  * debian/copyright: follow the mDNS sources to mdns/.
+
+ -- Ari-Santa <apeach@live.no>  Wed, 25 Nov 2026 22:40:00 +0100
+
 shairport-sync-desktop (5.6.2-4) trixie; urgency=medium
 
   * AirPlay Receiver is now a Rust program, with the same window. It is

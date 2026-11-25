@@ -1,6 +1,6 @@
 Name:           shairport-sync-desktop
-Version:        5.6.2
-Release:        4%{?dist}
+Version:        5.6.3
+Release:        1%{?dist}
 Summary:        AirPlay 2 audio receiver for desktop users
 
 # Shairport Sync is MIT, with tinyhttp (linked for the DACP client that the
@@ -248,6 +248,19 @@ fi
 %{_mandir}/man8/nqptp.8*
 
 %changelog
+* Wed Nov 25 2026 Ari-Santa <apeach@live.no> - 5.6.3-1
+- Update to Shairport Sync 5.6.3
+- The volume that the D-Bus and MPRIS interfaces report, and so the slider
+  in AirPlay Receiver, no longer lags one change behind
+- The D-Bus and MPRIS objects are exported before the bus name appears, so
+  a client that asks at once no longer finds no object
+- No crash on exit when libsoxr is in use
+- The name and device details of a previous sender are no longer kept for
+  the next connection
+- The MPRIS Rate property is 1.0
+- New optional dbus_nametag setting and --dbus-nametag option, and a new
+  "metadata" mDNS backend. Neither is used by default
+
 * Wed Nov 25 2026 Ari-Santa <apeach@live.no> - 5.6.2-4
 - AirPlay Receiver is now a Rust program, with the same window. It is
   installed as /usr/bin/shairport-sync-gui itself, with the window's QML and

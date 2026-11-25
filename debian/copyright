@@ -25,7 +25,7 @@ Copyright: 2013 Muffinman, Skaman
            2014-2026 Mike Brady
 License: MIT
 
-Files: mdns_dns_sd.c mdns_external.c mdns_tinysvcmdns.c
+Files: mdns/mdns_dns_sd.c mdns/mdns_external.c mdns/mdns_tinysvcmdns.c
 Copyright: 2013 Paul Lietar
            2014-2025 Mike Brady
 License: MIT
@@ -80,7 +80,7 @@ Copyright: 2005 David Hammerton
 License: MIT
 Comment: Not compiled into this package.
 
-Files: tinysvcmdns.c tinysvcmdns.h
+Files: mdns/tinysvcmdns/tinysvcmdns.c mdns/tinysvcmdns/tinysvcmdns.h
 Copyright: 2011 Darell Tan
            2014-2025 Mike Brady
 License: BSD-3-Clause
