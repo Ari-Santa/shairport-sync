@@ -1,6 +1,6 @@
 Name:           shairport-sync-desktop
 Version:        5.6.2
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        AirPlay 2 audio receiver for desktop users
 
 # Shairport Sync is MIT, with tinyhttp (linked for the DACP client that the
@@ -248,6 +248,23 @@ fi
 %{_mandir}/man8/nqptp.8*
 
 %changelog
+* Wed Nov 25 2026 Ari-Santa <apeach@live.no> - 5.6.2-4
+- AirPlay Receiver is now a Rust program, with the same window. It is
+  installed as /usr/bin/shairport-sync-gui itself, with the window's QML and
+  icon compiled in, and no longer needs python3 or python3-pyqt6.
+  /usr/share/shairport-sync-gui is removed on upgrade
+- Build the app with cargo, which downloads the crates that gui/Cargo.lock
+  pins from crates.io, so the build needs network access. New build
+  requirements: cargo, lld, qt6-qtbase-devel and qt6-qtdeclarative-devel.
+  The crates linked into the app and their licenses are listed in
+  LICENSE.dependencies
+- A call to the receiver or to systemd that gets no reply in a second is
+  reported as "No reply in time"
+- rpm/build-rpm.sh: KEEP_DEBUG=1 also copies the debuginfo and debugsource
+  packages
+- gui/install.sh builds the app with cargo and removes the Python version it
+  installed before
+
 * Thu Nov 05 2026 Ari-Santa <apeach@live.no> - 5.6.2-3
 - Install the desktop defaults as /etc/shairport-sync-desktop.conf and make
   each user's settings from that. /etc/shairport-sync.conf is the path of

@@ -1,3 +1,23 @@
+shairport-sync-desktop (5.6.2-4) trixie; urgency=medium
+
+  * AirPlay Receiver is now a Rust program, with the same window. It is
+    installed as /usr/bin/shairport-sync-gui itself, with the window's QML
+    and icon compiled in, and no longer needs python3, python3-pyqt6 or
+    python3-pyqt6.qtquick. /usr/share/shairport-sync-gui is removed on
+    upgrade.
+  * Build the app with cargo, which downloads the crates that gui/Cargo.lock
+    pins from crates.io, so the build needs network access. New build
+    dependencies: cargo, lld, qt6-base-dev, qt6-declarative-dev and
+    ca-certificates. The crates linked into the app and their licences are
+    listed in /usr/share/doc/shairport-sync-desktop/LICENSE.dependencies.
+  * A call to the receiver or to systemd that gets no reply in a second is
+    reported as "No reply in time".
+  * debian/build-deb.sh: KEEP_DEBUG=1 also copies the -dbgsym package.
+  * gui/install.sh builds the app with cargo and removes the Python version
+    it installed before.
+
+ -- Ari-Santa <apeach@live.no>  Wed, 25 Nov 2026 21:55:00 +0100
+
 shairport-sync-desktop (5.6.2-3) trixie; urgency=medium
 
   * Install the desktop defaults as /etc/shairport-sync-desktop.conf and

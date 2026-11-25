@@ -48,19 +48,19 @@ systemd user services. A .deb installs only on the release it was built for.
 Debian 13 (amd64):
 
 ```
-sudo apt install ./shairport-sync-desktop_5.6.2-3_amd64.deb
+sudo apt install ./shairport-sync-desktop_5.6.2-4_amd64.deb
 ```
 
 Ubuntu 26.10 (amd64):
 
 ```
-sudo apt install ./shairport-sync-desktop_5.6.2-3.ubuntu26.10_amd64.deb
+sudo apt install ./shairport-sync-desktop_5.6.2-4.ubuntu26.10_amd64.deb
 ```
 
 Fedora 45 (x86_64), no extra repositories needed:
 
 ```
-sudo dnf install ./shairport-sync-desktop-5.6.2-3.fc45.x86_64.rpm
+sudo dnf install ./shairport-sync-desktop-5.6.2-4.fc45.x86_64.rpm
 ```
 
 On Fedora, also open the [firewall](#firewall) for it.
