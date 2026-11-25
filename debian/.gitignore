@@ -9,3 +9,6 @@
 /tmp/
 /autoreconf.after
 /autoreconf.before
+/cargo-home/
+/cargo-target/
+/LICENSE.dependencies

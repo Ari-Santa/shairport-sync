@@ -6,19 +6,30 @@ Summary:        AirPlay 2 audio receiver for desktop users
 # Shairport Sync is MIT, with tinyhttp (linked for the DACP client that the
 # D-Bus and MPRIS interfaces need) under BSD-2-Clause; NQPTP and the NQPTP
 # interface header Shairport Sync includes are GPL-2.0-only; the AirPlay
-# Receiver app and packaging are MIT.
-License:        MIT AND BSD-2-Clause AND GPL-2.0-only
+# Receiver app and packaging are MIT. The rest are the licenses of the Rust
+# crates that are statically linked into the app, as "cargo tree" reports
+# them: LICENSE.dependencies, made in %%build, lists each crate.
+License:        MIT AND BSD-2-Clause AND GPL-2.0-only AND (MIT OR Apache-2.0) AND Unicode-3.0 AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (Unlicense OR MIT) AND Zlib
 URL:            https://github.com/Ari-Santa/shairport-sync
 # Made by rpm/build-rpm.sh from the git tree, including the nqptp submodule.
 Source0:        %{name}-%{version}.tar.gz
+# The source is not self-contained: the app's Rust crates are neither in the
+# tarball nor taken from Fedora's rust-*-devel packages. In %%build, cargo
+# downloads them from crates.io, at the versions and checksums that
+# gui/Cargo.lock pins, so the build needs network access (it does not work in
+# mock or Koji as it is), and %%cargo_prep and %%cargo_build are not used.
 
 BuildRequires:  autoconf
 BuildRequires:  automake
+BuildRequires:  cargo >= 1.85
 BuildRequires:  desktop-file-utils
 BuildRequires:  firewalld-filesystem
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  libtool
+# The app's C++ and Rust objects only link with lld, which the build picks
+# when it is installed.
+BuildRequires:  lld
 BuildRequires:  make
 BuildRequires:  pkgconfig(alsa)
 BuildRequires:  pkgconfig(avahi-client)
@@ -38,15 +49,17 @@ BuildRequires:  pkgconfig(popt)
 BuildRequires:  pkgconfig(soxr)
 BuildRequires:  pkgconfig(uuid)
 BuildRequires:  /usr/bin/plistutil
+BuildRequires:  qt6-qtbase-devel
+BuildRequires:  qt6-qtdeclarative-devel
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  xxd
 
 Requires:       avahi
 Requires:       firewalld-filesystem
+# The Qt Quick modules that the app's window imports when it runs, and the
+# SVG plugin for its icons: nothing finds these automatically.
 Requires:       kf6-kirigami
 Requires:       kf6-qqc2-desktop-style
-Requires:       python3
-Requires:       python3-pyqt6
 Requires:       qt6-qtdeclarative
 Requires:       qt6-qtsvg
 Recommends:     pipewire
@@ -103,6 +116,21 @@ autoreconf -fi
 %make_build
 popd
 
+# AirPlay Receiver. RUSTFLAGS, as set for every %%build, has the debug
+# information that the -debuginfo package is made from.
+export CARGO_HOME=$PWD/.cargo-home
+cargo build %{?_smp_mflags} --release --locked --manifest-path gui/Cargo.toml
+{
+    echo "The Rust crates that are statically linked into %{_bindir}/shairport-sync-gui,"
+    echo "each with its license as an SPDX expression. Made at build time by \"cargo tree\""
+    echo "from gui/Cargo.lock. The Rust standard library (MIT OR Apache-2.0) is linked"
+    echo "in as well."
+    echo
+    cargo tree --locked --manifest-path gui/Cargo.toml \
+        --edges no-build,no-dev,no-proc-macro --prefix none --format '{l}: {p}' |
+        sed -e 's/ (\*)$//' -e 's/ (\/.*)$//' | LC_ALL=C sort -u
+} > LICENSE.dependencies
+
 %install
 # The D-Bus policy files are only for the system bus; this package puts both
 # interfaces on the session bus, so stage them aside and drop them.
@@ -127,12 +155,10 @@ install -D -m 0644 packaging/airplay-receiver.xml %{buildroot}%{_prefix}/lib/fir
 install -d %{buildroot}%{_userpresetdir}
 echo "enable shairport-sync.service" > %{buildroot}%{_userpresetdir}/80-shairport-sync-desktop.preset
 
-install -D -m 0755 gui/shairport-sync-gui %{buildroot}%{_datadir}/shairport-sync-gui/shairport-sync-gui
-install -D -m 0644 gui/qml/Main.qml %{buildroot}%{_datadir}/shairport-sync-gui/qml/Main.qml
-install -D -m 0644 gui/shairport-sync.svg %{buildroot}%{_datadir}/shairport-sync-gui/shairport-sync.svg
+# Main.qml and the icon the window falls back on are compiled into the program.
+install -D -m 0755 gui/target/release/shairport-sync-gui %{buildroot}%{_bindir}/shairport-sync-gui
 install -D -m 0644 gui/shairport-sync.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/shairport-sync.svg
 install -D -m 0644 gui/shairport-sync.desktop %{buildroot}%{_datadir}/applications/shairport-sync.desktop
-ln -s ../share/shairport-sync-gui/shairport-sync-gui %{buildroot}%{_bindir}/shairport-sync-gui
 install -D -m 0644 packaging/shairport-sync-gui.1 %{buildroot}%{_mandir}/man1/shairport-sync-gui.1
 
 %check
@@ -192,15 +218,25 @@ if [ "$1" -eq 0 ] && command -v loginctl >/dev/null 2>&1; then
 fi
 %systemd_user_preun shairport-sync.service
 
+%posttrans
+# Up to 5.6.2-3 the app was a Python script in /usr/share/shairport-sync-gui.
+# rpm has removed the files it had put there by now, and the directory with
+# them unless something else is in it. Python doesn't cache the script it is
+# started with, so nothing should be, but a __pycache__ in there would keep the
+# directory around for good.
+if [ -d %{_datadir}/shairport-sync-gui ]; then
+    rm -rf %{_datadir}/shairport-sync-gui/__pycache__
+    rmdir %{_datadir}/shairport-sync-gui 2>/dev/null || :
+fi
+
 %files
-%license COPYING LICENSES LICENSE.tinyhttp nqptp/LICENSE
+%license COPYING LICENSES LICENSE.tinyhttp LICENSE.dependencies nqptp/LICENSE
 %doc README.md README.gui.md
 %config(noreplace) %{_sysconfdir}/shairport-sync-desktop.conf
 %{_bindir}/shairport-sync
 # NQPTP runs in each user's session but must bind the PTP ports 319 and 320.
 %caps(cap_net_bind_service=ep) %{_bindir}/nqptp
 %{_bindir}/shairport-sync-gui
-%{_datadir}/shairport-sync-gui/
 %{_datadir}/applications/shairport-sync.desktop
 %{_datadir}/icons/hicolor/scalable/apps/shairport-sync.svg
 %{_userunitdir}/shairport-sync.service

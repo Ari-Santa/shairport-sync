@@ -3,3 +3,13 @@
 # "systemctl --user --machine=USER@" for each user logged in at the time.
 maintainer-script-calls-systemctl [postinst:*]
 maintainer-script-calls-systemctl [prerm:*]
+
+# Not a second copy of debian/copyright: the list, made by "cargo tree" during
+# the build, of the Rust crates that are statically linked into the app, with
+# the licence of each. debian/copyright refers to it.
+extra-license-file [usr/share/doc/shairport-sync-desktop/LICENSE.dependencies]
+
+# The app is Rust, which has no fortified variants of the C library's
+# functions to call. Its C++ part is built with dpkg's flags, including
+# -D_FORTIFY_SOURCE, but calls none of the functions that have one.
+hardening-no-fortify-functions [usr/bin/shairport-sync-gui]

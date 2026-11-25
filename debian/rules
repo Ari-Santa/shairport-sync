@@ -3,7 +3,29 @@
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
 PKG := debian/shairport-sync-desktop
-GUI_DIR := /usr/share/shairport-sync-gui
+
+# AirPlay Receiver (gui/) is a Rust program. Its crates are not taken from
+# Debian packages: cargo downloads them from crates.io during the build, at
+# the versions and checksums that gui/Cargo.lock pins, and links them
+# statically. So the build needs network access and the source package is not
+# self-contained; dh-cargo, which builds from packaged crates only, is not
+# used. Cargo's downloads and build output stay in the two directories below,
+# which the clean target removes.
+export CARGO_HOME := $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR := $(CURDIR)/debian/cargo-target
+
+# Nothing passes dpkg's build flags to cargo. RUSTFLAGS has a value only on
+# Ubuntu. Of LDFLAGS, the hardening options (-z relro, -z now) go to the
+# linker that rustc runs; the C++ part of the app is compiled by cargo's cc
+# crate, which reads CXXFLAGS. Full debug information, unstripped, is for
+# dh_strip to move into the -dbgsym package, with the build directory mapped
+# to "." as -ffile-prefix-map does for C.
+comma := ,
+GUI_RUSTFLAGS := $(shell dpkg-buildflags --get RUSTFLAGS 2>/dev/null) \
+	$(patsubst %,-Clink-arg=%,$(filter -Wl$(comma)-z$(comma)%,$(shell dpkg-buildflags --get LDFLAGS))) \
+	--remap-path-prefix=$(CURDIR)=.
+GUI_CXXFLAGS := $(shell dpkg-buildflags --get CXXFLAGS) $(shell dpkg-buildflags --get CPPFLAGS)
+GUI_JOBS := $(patsubst parallel=%,--jobs=%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
 
 %:
 	dh $@
@@ -30,6 +52,21 @@ override_dh_auto_configure:
 override_dh_auto_build:
 	dh_auto_build
 	dh_auto_build -Dnqptp
+	RUSTFLAGS="$(GUI_RUSTFLAGS)" CXXFLAGS="$(GUI_CXXFLAGS)" \
+	CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_PROFILE_RELEASE_STRIP=none \
+		cargo build --release --locked $(GUI_JOBS) --manifest-path gui/Cargo.toml
+	# The crates linked into the app and their licences, for the doc
+	# directory: see debian/copyright.
+	{ \
+		echo "The Rust crates that are statically linked into /usr/bin/shairport-sync-gui,"; \
+		echo "each with its licence as an SPDX expression. Made at build time by \"cargo tree\""; \
+		echo "from gui/Cargo.lock. The Rust standard library (MIT OR Apache-2.0) is linked"; \
+		echo "in as well."; \
+		echo; \
+		cargo tree --locked --manifest-path gui/Cargo.toml \
+			--edges no-build,no-dev,no-proc-macro --prefix none --format '{l}: {p}' | \
+			sed -e 's/ (\*)$$//' -e 's/ (\/.*)$$//' | LC_ALL=C sort -u; \
+	} > debian/LICENSE.dependencies
 
 override_dh_auto_install:
 	# The D-Bus policy files are only for the system bus; this package puts
@@ -51,18 +88,17 @@ override_dh_auto_install:
 	install -D -m 0644 packaging/nqptp.service $(PKG)/usr/lib/systemd/user/nqptp.service
 	install -D -m 0644 packaging/airplay-receiver.xml $(PKG)/usr/lib/firewalld/services/airplay-receiver.xml
 
-	install -D -m 0755 gui/shairport-sync-gui $(PKG)$(GUI_DIR)/shairport-sync-gui
-	install -D -m 0644 gui/qml/Main.qml $(PKG)$(GUI_DIR)/qml/Main.qml
-	install -D -m 0644 gui/shairport-sync.svg $(PKG)$(GUI_DIR)/shairport-sync.svg
+	# Main.qml and the icon the window falls back on are compiled into the
+	# program.
+	install -D -m 0755 $(CARGO_TARGET_DIR)/release/shairport-sync-gui $(PKG)/usr/bin/shairport-sync-gui
 	install -D -m 0644 gui/shairport-sync.svg $(PKG)/usr/share/icons/hicolor/scalable/apps/shairport-sync.svg
 	install -D -m 0644 gui/shairport-sync.desktop $(PKG)/usr/share/applications/shairport-sync.desktop
-	install -d $(PKG)/usr/bin
-	ln -s ../share/shairport-sync-gui/shairport-sync-gui $(PKG)/usr/bin/shairport-sync-gui
 	install -D -m 0644 packaging/shairport-sync-gui.1 $(PKG)/usr/share/man/man1/shairport-sync-gui.1
 
-# Upstream's README and the app's, which is named README.gui.md as in the RPM.
+# Upstream's README, the app's, which is named README.gui.md as in the RPM,
+# and the list of the crates linked into the app.
 override_dh_installdocs:
-	dh_installdocs README.md
+	dh_installdocs README.md debian/LICENSE.dependencies
 	install -m 0644 gui/README.md $(PKG)/usr/share/doc/shairport-sync-desktop/README.gui.md
 
 # Enable the receiver for every user at login (the unit itself skips system
@@ -73,3 +109,4 @@ override_dh_installsystemduser:
 override_dh_auto_clean:
 	dh_auto_clean
 	[ ! -f nqptp/Makefile ] || dh_auto_clean -Dnqptp
+	rm -rf debian/cargo-home debian/cargo-target debian/LICENSE.dependencies

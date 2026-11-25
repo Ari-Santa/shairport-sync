@@ -10,7 +10,12 @@
 # Packs the working tree (tracked and new, non-ignored files, plus the nqptp
 # submodule), builds it with dpkg-buildpackage inside the given image using
 # podman, and copies the .deb next to the source tree, where a host
-# dpkg-buildpackage would put it.
+# dpkg-buildpackage would put it. With KEEP_DEBUG=1 in the environment, the
+# package with the debug symbols (-dbgsym) is copied too.
+#
+# The build needs network access for more than the build dependencies: the
+# Rust crates of the AirPlay Receiver app (gui/) are downloaded from crates.io,
+# at the versions and checksums in gui/Cargo.lock.
 #
 # A binary .deb installs only on the release it was built on, because it
 # depends on that release's library versions (libavcodec61 and libsodium23 on
@@ -53,7 +58,7 @@ mkdir -p "$WORK/src" "$WORK/out"
 tar -C "$TOP" -cf - -T "$WORK/files" | tar -C "$WORK/src" -xf -
 
 echo "[..] Building shairport-sync-desktop in $IMAGE..."
-podman run --rm --sig-proxy=false --name "$CONTAINER" -v "$WORK:/work:Z" "$IMAGE" sh -ec '
+podman run --rm --sig-proxy=false --name "$CONTAINER" -e KEEP_DEBUG="$KEEP_DEBUG" -v "$WORK:/work:Z" "$IMAGE" sh -ec '
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends build-essential >/dev/null
@@ -77,10 +82,12 @@ podman run --rm --sig-proxy=false --name "$CONTAINER" -v "$WORK:/work:Z" "$IMAGE
     apt-get build-dep -y -qq --no-install-recommends ./ >/dev/null
     dpkg-buildpackage -b -us -uc
     cp /work/shairport-sync-desktop_*.deb /work/out/
+    # Named .ddeb on Ubuntu.
+    [ "$KEEP_DEBUG" != 1 ] || cp /work/shairport-sync-desktop-dbgsym_*deb /work/out/
 '
 
-cp "$WORK"/out/*.deb "$OUT/"
+cp "$WORK"/out/*deb "$OUT/"
 echo "[OK] Built in $IMAGE:"
-for deb in "$WORK"/out/*.deb; do
+for deb in "$WORK"/out/*deb; do
     echo "$OUT/$(basename "$deb")"
 done

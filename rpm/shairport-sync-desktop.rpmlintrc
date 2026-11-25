@@ -12,3 +12,7 @@ addFilter("spelling-error \('(conf|cmd|systemd)',")
 addFilter("incorrect-fsf-address /usr/share/licenses/shairport-sync-desktop/LICENSE$")
 # rpm/build-rpm.sh makes Source0 from the git tree, so it has no URL.
 addFilter("invalid-url Source0: shairport-sync-desktop-[0-9.]+\.tar\.gz$")
+# %posttrans removes a __pycache__ directory that Python may have left in
+# /usr/share/shairport-sync-gui, the directory of the app up to 5.6.2-3, which
+# would otherwise stay behind after the upgrade.
+addFilter("dangerous-command-in-%posttrans rm$")

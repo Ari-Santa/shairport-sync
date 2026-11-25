@@ -1,8 +1,11 @@
 #!/bin/sh
 
-# install.sh - Installs the AirPlay Receiver GUI for the current user
+# install.sh - Builds the AirPlay Receiver GUI and installs it for the current user
 #
 # Usage: sh gui/install.sh [--uninstall]
+#
+# Building needs cargo (Rust 1.85 or newer), a C++ compiler, lld and the Qt 6
+# development files; cargo downloads the app's Rust crates from crates.io.
 #
 # The app needs shairport-sync built with --with-dbus-interface and
 # --with-mpris-interface, running as the systemd user unit
@@ -14,44 +17,54 @@ set -e
 
 SRC_DIR=$(cd "$(dirname "$0")" && pwd)
 DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
-APP_DIR="$DATA_HOME/shairport-sync-gui"
 BIN_DIR="$HOME/.local/bin"
+BIN="$BIN_DIR/shairport-sync-gui"
 DESKTOP_DIR="$DATA_HOME/applications"
 ICON_DIR="$DATA_HOME/icons/hicolor/scalable/apps"
+# Where this script put the app up to 5.6.2-3, when it was a Python script,
+# with $BIN a link to it.
+OLD_APP_DIR="$DATA_HOME/shairport-sync-gui"
 
 if command -v dnf >/dev/null 2>&1; then
-    ADVICE="sudo dnf install python3-pyqt6 kf6-kirigami kf6-qqc2-desktop-style qt6-qtdeclarative qt6-qtsvg"
+    BUILD_ADVICE="sudo dnf install cargo gcc-c++ lld qt6-qtbase-devel qt6-qtdeclarative-devel"
+    ADVICE="sudo dnf install kf6-kirigami kf6-qqc2-desktop-style qt6-qtdeclarative qt6-qtsvg"
 else
-    ADVICE="sudo apt install python3-pyqt6 python3-pyqt6.qtquick qml6-module-org-kde-kirigami qml6-module-qtquick-effects qml6-module-org-kde-desktop qt6-svg-plugins"
+    BUILD_ADVICE="sudo apt install cargo g++ lld qt6-base-dev qt6-declarative-dev"
+    ADVICE="sudo apt install qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-effects qml6-module-org-kde-kirigami qml6-module-org-kde-desktop qt6-svg-plugins"
 fi
 
-# Loads the imports of Main.qml the way the app does: the window doesn't open
-# without them. (A bare QQmlEngine hangs on Kirigami 6.29's import.) Plasma's
-# Qt Quick style is used where it is installed.
-QML_CHECK='
-import sys
-from pathlib import Path
-from PyQt6.QtCore import QUrl, qInstallMessageHandler
-from PyQt6.QtQml import QQmlApplicationEngine
-from PyQt6.QtWidgets import QApplication
+# Qt 6's qmake, under the names the build looks for it.
+find_qmake() {
+    for qmake in ${QMAKE:+"$QMAKE"} qmake6 qmake-qt6 qmake; do
+        command -v "$qmake" >/dev/null 2>&1 || continue
+        case "$("$qmake" -query QT_VERSION 2>/dev/null)" in
+            6.*) echo "$qmake"; return 0 ;;
+        esac
+    done
+    return 1
+}
 
-qInstallMessageHandler(lambda *message: None)  # the errors are printed below
-app = QApplication(sys.argv[:1])
-engine = QQmlApplicationEngine()
-engine.setOutputWarningsToStandardError(False)
-errors = []
-engine.warnings.connect(lambda warnings: errors.extend(w.description() for w in warnings))
-main_qml = Path(sys.argv[1])
-imports = [line for line in main_qml.read_text().splitlines(True) if line.startswith("import ")]
-engine.loadData("".join(imports + ["QtObject {}\n"]).encode(), QUrl.fromLocalFile(str(main_qml)))
-if not engine.rootObjects():
-    print("[FAIL] Qt Quick modules the app needs are missing:", file=sys.stderr)
-    for error in errors:
-        print("  " + error, file=sys.stderr)
-    sys.exit(1)
-if not any(Path(path, "org/kde/desktop/qmldir").is_file() for path in engine.importPathList()):
-    print("[NOTE] The Plasma Qt Quick style (org.kde.desktop) is missing, so the app uses the default Qt style.")
-'
+# Whether a Qt Quick module, given as its directory (org/kde/kirigami), is
+# installed where the app looks for it.
+have_qml_module() {
+    saved_ifs=$IFS
+    IFS=:
+    for dir in $QML_DIRS; do
+        if [ -n "$dir" ] && [ -f "$dir/$1/qmldir" ]; then
+            IFS=$saved_ifs
+            return 0
+        fi
+    done
+    IFS=$saved_ifs
+    return 1
+}
+
+remove_python_install() {
+    if [ "$(readlink "$BIN" 2>/dev/null)" = "$OLD_APP_DIR/shairport-sync-gui" ]; then
+        rm -f "$BIN"
+    fi
+    [ ! -d "$OLD_APP_DIR" ] || rm -r -- "$OLD_APP_DIR"
+}
 
 refresh_launcher() {
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$DESKTOP_DIR" || true
@@ -74,42 +87,83 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 if [ "$1" = "--uninstall" ]; then
-    # Only what this script installed: a launcher entry or an icon of the same
-    # name that something else put there stays.
-    if [ "$(readlink "$BIN_DIR/shairport-sync-gui" 2>/dev/null)" = "$APP_DIR/shairport-sync-gui" ]; then
-        rm -f "$BIN_DIR/shairport-sync-gui"
-    fi
-    if grep -q -x -F "Exec=$APP_DIR/shairport-sync-gui" "$DESKTOP_DIR/shairport-sync.desktop" 2>/dev/null; then
+    # Only what this script installed, now or as the Python app: a launcher
+    # entry or an icon of the same name that something else put there stays,
+    # and so does a link of the program's name that points somewhere else.
+    if grep -q -x -F -e "Exec=$BIN" -e "Exec=$OLD_APP_DIR/shairport-sync-gui" \
+            "$DESKTOP_DIR/shairport-sync.desktop" 2>/dev/null; then
         rm -f "$DESKTOP_DIR/shairport-sync.desktop"
     fi
-    if cmp -s "$APP_DIR/shairport-sync.svg" "$ICON_DIR/shairport-sync.svg"; then
+    if cmp -s "$SRC_DIR/shairport-sync.svg" "$ICON_DIR/shairport-sync.svg" ||
+            cmp -s "$OLD_APP_DIR/shairport-sync.svg" "$ICON_DIR/shairport-sync.svg"; then
         rm -f "$ICON_DIR/shairport-sync.svg"
     fi
-    [ ! -d "$APP_DIR" ] || rm -r -- "$APP_DIR"
+    remove_python_install
+    if [ -f "$BIN" ] && [ ! -L "$BIN" ]; then
+        rm -f "$BIN"
+    fi
     refresh_launcher
-    echo "[OK] Removed \"AirPlay Receiver\" from $APP_DIR and the application launcher."
+    echo "[OK] Removed \"AirPlay Receiver\" from $BIN_DIR and the application launcher."
     exit 0
 fi
 
-if ! python3 -c "import PyQt6.QtDBus, PyQt6.QtQml, PyQt6.QtWidgets" 2>/dev/null; then
-    echo "[FAIL] PyQt6 with QML support is missing." >&2
-    echo "  [ADVICE] $ADVICE" >&2
-    exit 1
+# What the build needs. cargo names a Rust that is too old itself.
+MISSING=
+command -v cargo >/dev/null 2>&1 || MISSING="$MISSING, cargo"
+command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1 ||
+    command -v clang++ >/dev/null 2>&1 || MISSING="$MISSING, a C++ compiler"
+# With GNU ld the app doesn't link; the build uses lld when it finds it.
+command -v ld.lld >/dev/null 2>&1 || MISSING="$MISSING, lld"
+if QMAKE_BIN=$(find_qmake); then
+    QT_HEADERS=$("$QMAKE_BIN" -query QT_INSTALL_HEADERS 2>/dev/null)
+    [ -d "$QT_HEADERS/QtWidgets" ] || MISSING="$MISSING, the Qt 6 base development files"
+    [ -d "$QT_HEADERS/QtQuick" ] || MISSING="$MISSING, the Qt 6 declarative (Qt Quick) development files"
+else
+    MISSING="$MISSING, the Qt 6 development files (qmake6)"
 fi
-if ! QT_QPA_PLATFORM=offscreen python3 -c "$QML_CHECK" "$SRC_DIR/qml/Main.qml"; then
-    echo "  [ADVICE] $ADVICE" >&2
+if [ -n "$MISSING" ]; then
+    echo "[FAIL] Missing for the build: ${MISSING#, }." >&2
+    echo "  [ADVICE] $BUILD_ADVICE" >&2
     exit 1
 fi
 
-install -d "$APP_DIR/qml" "$BIN_DIR" "$DESKTOP_DIR" "$ICON_DIR"
-install -m 0755 "$SRC_DIR/shairport-sync-gui" "$APP_DIR/shairport-sync-gui"
-install -m 0644 "$SRC_DIR/qml/Main.qml" "$APP_DIR/qml/Main.qml"
-install -m 0644 "$SRC_DIR/shairport-sync.svg" "$APP_DIR/shairport-sync.svg"
+# The imports of Main.qml, which is compiled into the program: the window
+# doesn't open without them, and the program then only says so in a dialog.
+QML_DIRS="$("$QMAKE_BIN" -query QT_INSTALL_QML 2>/dev/null)${QML_IMPORT_PATH:+:$QML_IMPORT_PATH}"
+MISSING=
+for module in QtQuick QtQuick/Controls QtQuick/Effects QtQuick/Layouts org/kde/kirigami; do
+    have_qml_module "$module" || MISSING="$MISSING, $(echo "$module" | tr / .)"
+done
+if [ -n "$MISSING" ]; then
+    echo "[FAIL] Qt Quick modules the app needs are missing: ${MISSING#, }." >&2
+    echo "  [ADVICE] $ADVICE" >&2
+    exit 1
+fi
+if ! have_qml_module org/kde/desktop; then
+    echo "[NOTE] The Plasma Qt Quick style (org.kde.desktop) is missing, so the app uses the default Qt style."
+fi
+if [ ! -e "$("$QMAKE_BIN" -query QT_INSTALL_PLUGINS 2>/dev/null)/imageformats/libqsvg.so" ]; then
+    echo "[NOTE] Qt's SVG plugin is missing, so the app's icons may not show."
+    echo "  [ADVICE] $ADVICE"
+fi
+
+echo "[..] Building the app with cargo. The first build downloads its Rust crates and takes a few minutes..."
+if ! cargo build --release --locked --manifest-path "$SRC_DIR/Cargo.toml"; then
+    echo "[FAIL] The build failed." >&2
+    echo "  [ADVICE] $BUILD_ADVICE" >&2
+    exit 1
+fi
+BUILT="${CARGO_TARGET_DIR:-$SRC_DIR/target}/release/shairport-sync-gui"
+
+remove_python_install
+install -d "$BIN_DIR" "$DESKTOP_DIR" "$ICON_DIR"
+# Not through a link that something else left there.
+rm -f "$BIN"
+install -m 0755 "$BUILT" "$BIN"
 install -m 0644 "$SRC_DIR/shairport-sync.svg" "$ICON_DIR/shairport-sync.svg"
-ln -sf "$APP_DIR/shairport-sync-gui" "$BIN_DIR/shairport-sync-gui"
-sed "s|^Exec=.*|Exec=$APP_DIR/shairport-sync-gui|" "$SRC_DIR/shairport-sync.desktop" \
+sed "s|^Exec=.*|Exec=$BIN|" "$SRC_DIR/shairport-sync.desktop" \
     > "$DESKTOP_DIR/shairport-sync.desktop"
-echo "[OK] Installed to $APP_DIR"
+echo "[OK] Installed $BIN"
 
 refresh_launcher
 

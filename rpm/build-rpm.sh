@@ -8,7 +8,12 @@
 # submodule) into a source tarball, builds it with rpmbuild inside
 # registry.fedoraproject.org/fedora:<release> using podman, and copies the
 # binary and source RPMs next to the source tree, where dpkg-buildpackage
-# puts the .deb.
+# puts the .deb. With KEEP_DEBUG=1 in the environment, the -debuginfo and
+# -debugsource RPMs are copied too.
+#
+# The build needs network access for more than the build dependencies: the
+# Rust crates of the AirPlay Receiver app (gui/) are downloaded from crates.io,
+# at the versions and checksums in gui/Cargo.lock.
 
 set -e
 
@@ -62,3 +67,7 @@ podman run --rm --sig-proxy=false --name "$CONTAINER" -v "$WORK:/work:Z" "regist
 cp "$WORK"/RPMS/*/shairport-sync-desktop-"$VERSION"-*.rpm "$WORK"/SRPMS/*.src.rpm "$OUT/"
 echo "[OK] RPMs are in $OUT:"
 ls -1 "$OUT"/shairport-sync-desktop-"$VERSION"-*.rpm
+if [ "$KEEP_DEBUG" = 1 ]; then
+    cp "$WORK"/RPMS/*/shairport-sync-desktop-debug*-"$VERSION"-*.rpm "$OUT/"
+    ls -1 "$OUT"/shairport-sync-desktop-debug*-"$VERSION"-*.rpm
+fi

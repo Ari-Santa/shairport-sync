@@ -1,6 +1,6 @@
 # AirPlay Receiver (GUI)
 
-A small Kirigami/PyQt6 window that shows what Shairport Sync is playing (cover art,
+A small Kirigami/Rust (cxx-qt) window that shows what Shairport Sync is playing (cover art,
 title, artist, album, progress, the sending device and audio formats) and lets you
 play/pause, skip, change volume, disconnect the sender, and start or stop the receiver.
 
@@ -92,7 +92,10 @@ rpm/build-rpm.sh 45                # Fedora 45
 ```
 
 Each builds in a container of that release and puts the packages in the directory
-above the source tree. A .deb for a release other than the one in
+above the source tree. The build needs the network: besides the build
+dependencies, it downloads the app's Rust crates from crates.io, at the versions
+in `gui/Cargo.lock`, which are linked into the app; the package lists them and
+their licences in `LICENSE.dependencies`. A .deb for a release other than the one in
 `debian/changelog` (Debian 13) gets a version suffix such as `~ubuntu26.10`; in
 GitHub's release downloads the `~` becomes a `.`. The Debian and RPM packaging
 share the user services, default settings and firewall service in `packaging/`.
@@ -122,15 +125,26 @@ share the user services, default settings and firewall service in `packaging/`.
   ```
   The Output picker and Use Device Volume need `output_backend` set in the file;
   `-o pipewire` on the command line isn't enough.
-* PyQt6 with QML and Kirigami, on Debian/Ubuntu:
+* To build the app: Rust 1.85 or newer with cargo, a C++ compiler, lld (the app
+  doesn't link with GNU ld) and the Qt 6 development files, on Debian/Ubuntu:
   ```
-  sudo apt install python3-pyqt6 python3-pyqt6.qtquick qml6-module-org-kde-kirigami \
-      qml6-module-qtquick-effects qml6-module-org-kde-desktop qt6-svg-plugins
+  sudo apt install cargo g++ lld qt6-base-dev qt6-declarative-dev
   ```
   or on Fedora:
   ```
-  sudo dnf install python3-pyqt6 kf6-kirigami kf6-qqc2-desktop-style \
-      qt6-qtdeclarative qt6-qtsvg
+  sudo dnf install cargo gcc-c++ lld qt6-qtbase-devel qt6-qtdeclarative-devel
+  ```
+  The build downloads the app's Rust crates from crates.io, at the versions in
+  `gui/Cargo.lock`.
+* To run it: Qt Quick with Kirigami, on Debian/Ubuntu:
+  ```
+  sudo apt install qml6-module-qtquick qml6-module-qtquick-controls \
+      qml6-module-qtquick-layouts qml6-module-qtquick-effects \
+      qml6-module-org-kde-kirigami qml6-module-org-kde-desktop qt6-svg-plugins
+  ```
+  or on Fedora:
+  ```
+  sudo dnf install kf6-kirigami kf6-qqc2-desktop-style qt6-qtdeclarative qt6-qtsvg
   ```
   Without Plasma's Qt Quick style (`qml6-module-org-kde-desktop`,
   `kf6-qqc2-desktop-style`) the window has Qt's default look.
@@ -160,10 +174,11 @@ the D-Bus and MPRIS interfaces on the session bus, where the app looks for them,
 unless the settings name another bus. `setcap` lets NQPTP use the PTP ports; repeat
 it after each `make install` of NQPTP.
 
-`gui/install.sh` checks that the Qt Quick modules the window needs are installed,
-copies the app to `~/.local/share/shairport-sync-gui`, links
+`gui/install.sh` checks that what the build and the window need is installed,
+builds the app with cargo (in `gui/target`), installs it as
 `~/.local/bin/shairport-sync-gui`, and adds "AirPlay Receiver" to the application
-launcher. The desktop file is named `shairport-sync.desktop` to match the
+launcher. It also removes the Python version of the app that it installed up to
+5.6.2-3, in `~/.local/share/shairport-sync-gui`. The desktop file is named `shairport-sync.desktop` to match the
 `DesktopEntry` that shairport-sync reports over MPRIS, so Plasma's media controls
 show the same icon. `sh gui/install.sh --uninstall` removes the app again; do that
 before you install the package, as this copy would be started instead of the
@@ -208,4 +223,5 @@ System accounts, such as the login screen's, never run the receiver.
 * Cover art is kept in `$XDG_RUNTIME_DIR/shairport-sync/coverart`, which only you
   can read. The receiver points `cover_art_cache_directory` there when it starts,
   as long as that line is still commented out as shipped.
-* The window can be run straight from the source tree: `gui/shairport-sync-gui`.
+* The window can be run straight from the source tree:
+  `cargo run --release --manifest-path gui/Cargo.toml`.

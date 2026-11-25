@@ -11,6 +11,17 @@ if [ "$1" = "configure" ]; then
     fi
 fi
 
+# Up to 5.6.2-3 the app was a Python script in /usr/share/shairport-sync-gui.
+# dpkg has removed the files it had put there, and the directory with them
+# unless something else is in it. Python doesn't cache the script it is started
+# with, so nothing should be, but a __pycache__ in there would keep the
+# directory around for good.
+if [ "$1" = "configure" ] && dpkg --compare-versions "$2" le-nl 5.6.2-3 &&
+        [ -d "$DPKG_ROOT/usr/share/shairport-sync-gui" ]; then
+    rm -rf "$DPKG_ROOT/usr/share/shairport-sync-gui/__pycache__"
+    rmdir "$DPKG_ROOT/usr/share/shairport-sync-gui" 2>/dev/null || true
+fi
+
 # Ubuntu's shairport-sync ships a user unit of the same name, disabled.
 # deb-systemd-helper keeps its record of that after this package replaces it,
 # and the code below then leaves the receiver off. This package always enables

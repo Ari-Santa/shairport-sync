@@ -2,6 +2,17 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: shairport-sync
 Upstream-Contact: Mike Brady <4265913+mikebrady@users.noreply.github.com>
 Source: https://github.com/mikebrady/shairport-sync
+Comment: The AirPlay Receiver app in gui/ is a Rust program. The Rust crates
+ it uses are not part of this source: cargo downloads them from crates.io
+ when the package is built, at the versions and checksums recorded in
+ gui/Cargo.lock, and they are statically linked into
+ /usr/bin/shairport-sync-gui, as is the Rust standard library. The build
+ writes their names, versions and licences to
+ /usr/share/doc/shairport-sync-desktop/LICENSE.dependencies. They are under
+ "MIT OR Apache-2.0" (most of them, and the standard library), MIT,
+ "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT" (linux-raw-sys,
+ rustix), "Unlicense OR MIT" (memchr), Zlib (foldhash) and
+ "(MIT OR Apache-2.0) AND Unicode-3.0" (unicode-ident).
 
 Files: *
 Copyright: 2011-2013 James Laird <jhl@mafipulation.org>
